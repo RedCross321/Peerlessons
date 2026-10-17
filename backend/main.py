@@ -234,13 +234,7 @@ def get_websocket_user(token: str | None, db: Session) -> User:
 def health():
     return {"status": "ok"}
 
-
-@app.get("/api")
-def root():
-    return {"message": "Hello World!"}
-
-
-@app.post("/api/register", response_model=Token, status_code=status.HTTP_201_CREATED)
+@app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED, tags=["Auth"])
 def register(user_in: UserCreate, db: DbSession) -> Any:
     if db.query(User).filter(User.email == user_in.email).first():
         raise HTTPException(
@@ -266,7 +260,7 @@ def register(user_in: UserCreate, db: DbSession) -> Any:
     return {"access_token": token, "token_type": "bearer", "user": user}
 
 
-@app.post("/api/login", response_model=Token)
+@app.post("/api/auth/login", response_model=Token, tags=["Auth"])
 def login(user_in: UserLogin, db: DbSession) -> Any:
     user = db.query(User).filter(User.email == user_in.email).first()
     if not user or not verify_password(user_in.password, user.password):
@@ -289,7 +283,7 @@ def read_me(current_user: CurrentUser) -> User:
     return current_user
 
 
-@app.post("/api/rooms", response_model=RoomRead)
+@app.post("/api/room", response_model=RoomRead, tags=["Room"])
 def create_room(
     room_in: RoomCreate,
     db: DbSession,
@@ -318,7 +312,7 @@ def create_room(
     return room
 
 
-@app.get("/api/rooms/{room_id}", response_model=RoomRead)
+@app.get("/api/room/{room_id}", response_model=RoomRead, tags=["Room"])
 def get_room(room_id: UUID, db: DbSession) -> Room:
     room = db.query(Room).filter(Room.id == room_id).first()
     if not room:
