@@ -1,10 +1,10 @@
 import hashlib
-import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import bcrypt
+from config import settings
 from database import get_db
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -12,16 +12,7 @@ from jose import JWTError, jwt
 from models import RefreshToken, User
 from sqlalchemy.orm import Session
 
-SECRET_KEY: str = os.environ.get("SECRET_KEY", "")
-if not SECRET_KEY:
-    raise ValueError(
-        "КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения SECRET_KEY не установлена!"
-    )
-
 ALGORITHM = "HS256"
-
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
@@ -61,11 +52,11 @@ def create_access_token(
     to_encode["type"] = "access"
 
     expire = datetime.now(UTC) + (
-        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_delta or timedelta(minutes=settings.access_token_expire_minutes)
     )
     to_encode["exp"] = expire
 
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(to_encode, settings.secret_key, algorithm=ALGORITHM)
 
 
 def create_refresh_token(db: Session, user_id: int) -> str:
@@ -81,10 +72,10 @@ def create_refresh_token(db: Session, user_id: int) -> str:
         "type": "refresh",
     }
 
-    expire = datetime.now(UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    expire = datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days)
     to_encode["exp"] = expire
 
-    token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    token = jwt.encode(to_encode, settings.secret_key, algorithm=ALGORITHM)
 
     new_refresh_token = RefreshToken(
         user_id=user_id,
@@ -105,7 +96,7 @@ def verify_refresh_token(db: Session, token: str) -> RefreshToken:
     Декодирует токен, проверяет подпись и наличие jti в БД.
     """
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
 
         if payload.get("type") != "refresh":
             raise HTTPException(
@@ -216,7 +207,7 @@ def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
 
         if payload.get("type") != "access":
             raise credentials_exception

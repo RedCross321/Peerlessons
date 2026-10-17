@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 from uuid import UUID
 
+from config import settings
 from database import Base, engine, get_db
 from fastapi import (
     Depends,
@@ -18,7 +19,6 @@ from models import Room, User
 from schemas import RoomCreate, RoomRead, Token, UserCreate, UserLogin, UserRead
 from security import (
     ALGORITHM,
-    SECRET_KEY,
     create_access_token,
     get_current_user,
     get_password_hash,
@@ -207,7 +207,7 @@ def get_websocket_user(token: str | None, db: Session) -> User:
         )
 
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
         sub = payload.get("sub")
         if sub is None:
             raise HTTPException(
