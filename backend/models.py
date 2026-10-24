@@ -33,6 +33,10 @@ class User(Base):
     )
     participations = relationship("RoomParticipant", back_populates="user")
 
+    refresh_tokens = relationship(
+        "RefreshToken", back_populates="user", cascade="all, delete-orphan"
+    )
+
 
 class Room(Base):
     __tablename__ = "rooms"
