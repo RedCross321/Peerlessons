@@ -10,19 +10,31 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
 from jose import JWTError, jwt
 from models import Room, User
-from schemas import RoomCreate, RoomRead, Token, UserCreate, UserLogin, UserRead
+from schemas import (
+    RefreshTokenRequest,
+    RoomCreate,
+    RoomRead,
+    Token,
+    UserCreate,
+    UserLogin,
+    UserRead,
+)
 from security import (
     ALGORITHM,
     create_access_token,
+    create_refresh_token,
     get_current_user,
     get_password_hash,
+    revoke_refresh_token_by_value,
     verify_password,
+    verify_refresh_token,
 )
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -148,6 +160,7 @@ class ConnectionManager:
                 "showPreview": False,
                 "cursors": {},          # user_id -> {username, selection, color}
                 "raisedHands": [],      # [{user_id, username}]
+                "currentEditorId": None,  # актуальный редактор для всех соединений
             }
         return self.room_state[room_id]
 
@@ -288,7 +301,14 @@ def register(user_in: UserCreate, db: DbSession) -> Any:
     db.refresh(user)
 
     token = create_access_token(data={"sub": user.id})
-    return {"access_token": token, "token_type": "bearer", "user": user}
+    refresh_token = create_refresh_token(db, user.id)
+    db.commit()
+    return {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": user,
+    }
 
 
 @app.post("/api/auth/login", response_model=Token, tags=["Auth"])
@@ -306,7 +326,52 @@ def login(user_in: UserLogin, db: DbSession) -> Any:
         )
 
     token = create_access_token(data={"sub": user.id})
-    return {"access_token": token, "token_type": "bearer", "user": user}
+    refresh_token = create_refresh_token(db, user.id)
+    db.commit()
+    return {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.post("/api/auth/refresh", response_model=Token, tags=["Auth"])
+def refresh_access_token(token_in: RefreshTokenRequest, db: DbSession) -> Any:
+    """Выдаёт новый access-токен по действующему refresh-токену."""
+    db_token = verify_refresh_token(db, token_in.refresh_token)
+
+    user = db.query(User).filter(User.id == db_token.user_id).first()
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Пользователь не найден или деактивирован",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(data={"sub": user.id})
+    return {
+        "access_token": token,
+        # Refresh-токен не ротируем, чтобы не ломать параллельные вкладки.
+        "refresh_token": token_in.refresh_token,
+        "token_type": "bearer",
+        "user": user,
+    }
+
+
+@app.post(
+    "/api/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Auth"],
+)
+def logout(token_in: RefreshTokenRequest, db: DbSession) -> Response:
+    """
+    Отзывает переданный refresh-токен.
+    Идемпотентен: повторный выход или невалидный токен не считаются ошибкой.
+    """
+    revoke_refresh_token_by_value(db, token_in.refresh_token)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/api/me", response_model=UserRead)
@@ -370,14 +435,19 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
 
     await manager.connect(room_id, websocket, user.id, user.username or "Участник")
     state = manager._ensure_state(room_id)
+    # Сессия БД у каждого WebSocket своя и видит только своё состояние,
+    # поэтому текущего редактора держим в общем состоянии комнаты.
+    if state.get("currentEditorId") is None:
+        state["currentEditorId"] = room.current_editor_id
 
     # ===== ← НОВОЕ: отправляем ПОЛНОЕ состояние комнаты новичку =====
     current_code = room.current_code if isinstance(room.current_code, dict) else {}
     participants = manager.get_participants(room_id)
 
     # Имя текущего редактора
+    editor_id = state.get("currentEditorId")
     editor_username = next(
-        (p["username"] for p in participants if p["user_id"] == room.current_editor_id),
+        (p["username"] for p in participants if p["user_id"] == editor_id),
         None,
     )
 
@@ -387,9 +457,9 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
         "activeTab": current_code.get("activeTab", "index.html"),
         "showPreview": state["showPreview"],
         "currentEditor": {
-            "user_id": room.current_editor_id,
+            "user_id": editor_id,
             "username": editor_username,
-        } if room.current_editor_id else None,
+        } if editor_id else None,
         "hostId": room.host_id,
         "participants": participants,
         "raisedHands": state["raisedHands"],
@@ -409,7 +479,7 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
 
             # ---------- code-update ----------
             if msg_type == "code-update":
-                if room.current_editor_id != user.id:
+                if state.get("currentEditorId") != user.id:
                     continue
 
                 new_code: dict[str, Any] = {
@@ -431,6 +501,10 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
 
             # ---------- raise-hand ----------
             elif msg_type == "raise-hand":
+                # Создателю комнаты рука не нужна: он возвращает права кнопкой
+                if room.host_id == user.id:
+                    continue
+
                 # ← НОВОЕ: сохраняем в state, чтобы новички видели
                 if not any(h["user_id"] == user.id for h in state["raisedHands"]):
                     state["raisedHands"].append({
@@ -447,6 +521,17 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
                     },
                 )
 
+            # ---------- lower-hand ----------
+            elif msg_type == "lower-hand":
+                state["raisedHands"] = [
+                    h for h in state["raisedHands"] if h["user_id"] != user.id
+                ]
+
+                await manager.broadcast(
+                    room_id,
+                    {"type": "hand-lowered", "user_id": user.id},
+                )
+
             # ---------- grant-edit ----------
             elif msg_type == "grant-edit":
                 if room.host_id != user.id:
@@ -455,11 +540,16 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
                 target_id = data.get("user_id")
                 room.current_editor_id = target_id
                 db.commit()
+                state["currentEditorId"] = target_id
 
                 # Убираем руку
                 state["raisedHands"] = [
                     h for h in state["raisedHands"] if h["user_id"] != target_id
                 ]
+                await manager.broadcast(
+                    room_id,
+                    {"type": "hand-lowered", "user_id": target_id},
+                )
 
                 target_name = next(
                     (
@@ -483,13 +573,13 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
             elif msg_type == "revoke-edit":
                 # ← ИЗМЕНЕНО: может отозвать и хост, и сам редактор
                 is_host = room.host_id == user.id
-                is_current_editor = room.current_editor_id == user.id
+                is_current_editor = state.get("currentEditorId") == user.id
 
                 if not (is_host or is_current_editor):
                     continue
 
                 # ← НОВОЕ: очищаем курсор того, у кого забрали права
-                old_editor_id = room.current_editor_id
+                old_editor_id = state.get("currentEditorId")
                 if old_editor_id:
                     state["cursors"].pop(str(old_editor_id), None)
                     await manager.broadcast(
@@ -499,6 +589,7 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
 
                 room.current_editor_id = room.host_id
                 db.commit()
+                state["currentEditorId"] = room.host_id
 
                 host_name = next(
                     (
@@ -521,6 +612,9 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
             # ---------- preview-toggle ----------
             # ← НОВОЕ
             elif msg_type == "preview-toggle":
+                # Окном результата управляет только текущий редактор
+                if state.get("currentEditorId") != user.id:
+                    continue
                 show = bool(data.get("show", False))
                 state["showPreview"] = show
                 await manager.broadcast(
@@ -581,22 +675,23 @@ async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> N
                 safe_code = (
                     room.current_code if isinstance(room.current_code, dict) else {}
                 )
+                current_editor_id = state.get("currentEditorId")
                 await websocket.send_json({
                     "type": "room-state",
                     "files": safe_code.get("files", {}),
                     "activeTab": safe_code.get("activeTab", "index.html"),
                     "showPreview": state["showPreview"],
                     "currentEditor": {
-                        "user_id": room.current_editor_id,
+                        "user_id": current_editor_id,
                         "username": next(
                             (
                                 p["username"]
                                 for p in manager.get_participants(room_id)
-                                if p["user_id"] == room.current_editor_id
+                                if p["user_id"] == current_editor_id
                             ),
                             None,
                         ),
-                    } if room.current_editor_id else None,
+                    } if current_editor_id else None,
                     "hostId": room.host_id,
                     "participants": manager.get_participants(room_id),
                     "raisedHands": state["raisedHands"],

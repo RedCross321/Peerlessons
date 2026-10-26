@@ -179,6 +179,37 @@ def revoke_refresh_token(db: Session, jti: str, user_id: int) -> bool:
     return False
 
 
+def revoke_refresh_token_by_value(db: Session, token: str) -> bool:
+    """
+    Отзывает Refresh Token по его значению.
+    Не выбрасывает исключение для невалидных токенов: выход идемпотентен.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            settings.secret_key,
+            algorithms=[ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except JWTError:
+        return False
+
+    if payload.get("type") != "refresh":
+        return False
+
+    jti = payload.get("jti")
+    sub = payload.get("sub")
+    if not jti or sub is None:
+        return False
+
+    try:
+        user_id = int(sub)
+    except (ValueError, TypeError):
+        return False
+
+    return revoke_refresh_token(db, jti, user_id)
+
+
 def revoke_all_user_tokens(db: Session, user_id: int) -> int:
     """
     Отзывает все Refresh Token'ы пользователя.

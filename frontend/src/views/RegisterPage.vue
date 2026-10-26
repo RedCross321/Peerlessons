@@ -1,43 +1,112 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import api, { saveAuth } from '@/auth'
+import ErrorAlert from '@/components/ErrorAlert.vue'
+import { getErrorMessages } from '@/utils/errors'
 
 const router = useRouter()
 const username = ref('')
 const email = ref('')
 const password = ref('')
 const password_check = ref('')
-const valid_password = ref(true)
-const errorMessage = ref('')
+const fieldErrors = ref({})
+const errorMessages = ref([])
 const successMessage = ref('')
 const isLoading = ref(false)
 
-const psw_check_valid = () => {
-  valid_password.value = password.value === password_check.value && password.value.length > 0
+// Путь, на который нужно вернуться после регистрации и входа.
+const redirectTarget = computed(() => {
+  const redirect = router.currentRoute.value.query.redirect
+  return typeof redirect === 'string' && redirect.startsWith('/') ? redirect : null
+})
+
+const passwordsMismatch = computed(
+  () => password_check.value.length > 0 && password.value !== password_check.value
+)
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+function clearFieldError(field) {
+  if (errorMessages.value.length) errorMessages.value = []
+
+  if (!fieldErrors.value[field]) return
+
+  const next = { ...fieldErrors.value }
+  delete next[field]
+  fieldErrors.value = next
+}
+
+function clearPasswordErrors() {
+  if (errorMessages.value.length) errorMessages.value = []
+
+  const next = { ...fieldErrors.value }
+  delete next.password
+  delete next.password_check
+  fieldErrors.value = next
+}
+
+function validateForm() {
+  const errors = {}
+  const name = username.value.trim()
+  const mail = email.value.trim()
+
+  if (!name) {
+    errors.username = 'Введите имя пользователя'
+  } else if (name.length < 2) {
+    errors.username = 'Минимум 2 символа'
+  } else if (name.length > 50) {
+    errors.username = 'Максимум 50 символов'
+  } else if (!/^[a-zA-Z0-9_]+$/.test(name)) {
+    errors.username = 'Только латиница, цифры и знак подчёркивания'
+  }
+
+  if (!mail) {
+    errors.email = 'Введите email'
+  } else if (!EMAIL_RE.test(mail)) {
+    errors.email = 'Некорректный email'
+  }
+
+  if (!password.value) {
+    errors.password = 'Введите пароль'
+  } else if (password.value.length < 8) {
+    errors.password = 'Минимум 8 символов'
+  } else if (
+    !/[A-Z]/.test(password.value) ||
+    !/[a-z]/.test(password.value) ||
+    !/\d/.test(password.value) ||
+    !/[!@#$%^&*(),.?":{}|<>_+=-]/.test(password.value)
+  ) {
+    errors.password = 'Нужны заглавная и строчная буквы, цифра и спецсимвол'
+  }
+
+  if (!password_check.value) {
+    errors.password_check = 'Повторите пароль'
+  } else if (password.value !== password_check.value) {
+    errors.password_check = 'Пароли не совпадают'
+  }
+
+  fieldErrors.value = errors
+  return Object.keys(errors).length === 0
 }
 
 const register_user = async () => {
-  errorMessage.value = ''
+  errorMessages.value = []
   successMessage.value = ''
-  psw_check_valid()
 
-  if (!valid_password.value) {
-    errorMessage.value = 'Пароли не совпадают или слишком короткие'
-    return
-  }
+  if (!validateForm()) return
 
   isLoading.value = true
+
   try {
     await api.post('/auth/register', {
-          username: username.value,
-          email: email.value,
-          password: password.value
-        })
-
+      username: username.value.trim(),
+      email: email.value.trim(),
+      password: password.value
+    })
 
     const { data: loginData } = await api.post('/auth/login', {
-      email: email.value,
+      email: email.value.trim(),
       password: password.value
     }, {
       headers: {
@@ -45,31 +114,16 @@ const register_user = async () => {
       }
     })
 
-    saveAuth(loginData.access_token, loginData.user)
+    saveAuth(loginData.access_token, loginData.refresh_token, loginData.user)
 
     successMessage.value = 'Регистрация успешна! Переходим...'
 
     setTimeout(() => {
-      router.push('/')
+      router.replace(redirectTarget.value || '/')
     }, 800)
-
   } catch (err) {
     console.error('Ошибка при регистрации/входе:', err)
-    if (err.response?.status === 422) {
-      const details = err.response.data.detail
-      if (Array.isArray(details)) {
-        errorMessage.value = details.map(e => {
-          const field = e.loc?.length > 1 ? e.loc[1] : 'field'
-          return `• ${field}: ${e.msg}`
-        }).join('\n')
-      } else {
-        errorMessage.value = 'Ошибка валидации данных'
-      }
-    } else if (err.response?.data?.detail) {
-      errorMessage.value = err.response.data.detail
-    } else {
-      errorMessage.value = 'Ошибка сервера. Попробуйте позже.'
-    }
+    errorMessages.value = getErrorMessages(err, 'Не удалось зарегистрироваться')
   } finally {
     isLoading.value = false
   }
@@ -77,95 +131,118 @@ const register_user = async () => {
 </script>
 
 <template>
-  <div class="container mt-5">
-    <div class="row justify-content-center">
-      <div class="col-md-6">
-        <div class="card shadow-sm">
-          <div class="card-body p-4">
-            <h2 class="card-title text-center mb-2">Регистрация</h2>
-            <p class="text-center text-muted mb-4">Введите свои данные для создания аккаунта</p>
+  <main class="page">
+    <section class="card auth-card">
+      <div class="auth-head">
+        <RouterLink to="/" class="brand auth-brand">
+          <span class="brand-mark">/</span>
+          <span class="brand-name">Peerlessons</span>
+        </RouterLink>
+        <h1 class="auth-title">Создать аккаунт</h1>
+        <p class="auth-sub">Пара полей — и можно приглашать в комнату</p>
+      </div>
 
-            <div v-if="errorMessage" class="alert alert-danger" role="alert" style="white-space: pre-line;">
-              {{ errorMessage }}
-            </div>
-            <div v-if="successMessage" class="alert alert-success" role="alert">
-              {{ successMessage }}
-            </div>
+      <ErrorAlert :messages="errorMessages" title="Не удалось зарегистрироваться" />
+      <div v-if="successMessage" class="alert alert-success" role="alert">
+        {{ successMessage }}
+      </div>
 
-            <form @submit.prevent="register_user">
-              <div class="mb-3">
-                <label for="username" class="form-label">Имя пользователя</label>
-                <input
-                  type="text"
-                  id="username"
-                  class="form-control"
-                  v-model="username"
-                  required
-                  :disabled="isLoading"
-                  placeholder="Ваше имя"
-                />
-              </div>
-
-              <div class="mb-3">
-                <label for="email" class="form-label">Электронная почта</label>
-                <input
-                  type="email"
-                  id="email"
-                  class="form-control"
-                  v-model="email"
-                  required
-                  :disabled="isLoading"
-                  placeholder="name@example.com"
-                />
-              </div>
-
-              <div class="mb-3">
-                <label for="password" class="form-label">Пароль</label>
-                <input
-                  type="password"
-                  id="password"
-                  class="form-control"
-                  v-model="password"
-                  required
-                  :disabled="isLoading"
-                  @input="psw_check_valid"
-                />
-              </div>
-
-              <div class="mb-3">
-                <label for="password_check" class="form-label">Повторите пароль</label>
-                <input
-                  type="password"
-                  id="password_check"
-                  class="form-control"
-                  v-model="password_check"
-                  required
-                  :disabled="isLoading"
-                  @input="psw_check_valid"
-                />
-                <div v-if="password_check && !valid_password" class="form-text text-danger">
-                  Пароли не совпадают!
-                </div>
-              </div>
-
-              <button type="submit" class="btn btn-primary w-100" :disabled="isLoading || !valid_password">
-                <span v-if="isLoading" class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
-                {{ isLoading ? 'Регистрация...' : 'Зарегистрироваться' }}
-              </button>
-            </form>
-
-            <div class="text-center mt-3">
-              <p class="mb-0">Уже зарегистрированы? <RouterLink :to="{ name: 'login-page' }">Войдите в систему</RouterLink></p>
-            </div>
+      <form class="auth-form" novalidate @submit.prevent="register_user">
+        <div class="field">
+          <label class="label" for="username">Имя пользователя</label>
+          <input
+            type="text"
+            id="username"
+            class="input"
+            v-model="username"
+            required
+            :disabled="isLoading"
+            :aria-invalid="!!fieldErrors.username"
+            placeholder="Ваше имя"
+            autocomplete="username"
+            @input="clearFieldError('username')"
+          />
+          <div v-if="fieldErrors.username" class="field-error">
+            {{ fieldErrors.username }}
           </div>
         </div>
-      </div>
-    </div>
-  </div>
-</template>
 
-<style scoped>
-.card {
-  border-radius: 0.5rem;
-}
-</style>
+        <div class="field">
+          <label class="label" for="email">Электронная почта</label>
+          <input
+            type="email"
+            id="email"
+            class="input"
+            v-model="email"
+            required
+            :disabled="isLoading"
+            :aria-invalid="!!fieldErrors.email"
+            placeholder="name@example.com"
+            autocomplete="email"
+            @input="clearFieldError('email')"
+          />
+          <div v-if="fieldErrors.email" class="field-error">
+            {{ fieldErrors.email }}
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="label" for="password">Пароль</label>
+          <input
+            type="password"
+            id="password"
+            class="input"
+            v-model="password"
+            required
+            :disabled="isLoading"
+            :aria-invalid="!!fieldErrors.password"
+            placeholder="Минимум 8 символов"
+            autocomplete="new-password"
+            @input="clearPasswordErrors"
+          />
+          <div v-if="fieldErrors.password" class="field-error">
+            {{ fieldErrors.password }}
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="label" for="password_check">Повторите пароль</label>
+          <input
+            type="password"
+            id="password_check"
+            class="input"
+            v-model="password_check"
+            required
+            :disabled="isLoading"
+            :aria-invalid="!!fieldErrors.password_check"
+            placeholder="Ещё раз"
+            autocomplete="new-password"
+            @input="clearPasswordErrors"
+          />
+          <div v-if="fieldErrors.password_check" class="field-error">
+            {{ fieldErrors.password_check }}
+          </div>
+          <div v-else-if="passwordsMismatch" class="field-error">
+            Пароли не совпадают
+          </div>
+        </div>
+
+        <button
+          type="submit"
+          class="btn btn-primary btn-block btn-lg auth-submit"
+          :disabled="isLoading"
+        >
+          <span v-if="isLoading" class="spinner" aria-hidden="true"></span>
+          {{ isLoading ? 'Создаём аккаунт…' : 'Зарегистрироваться' }}
+        </button>
+      </form>
+
+      <p class="auth-footer">
+        Уже зарегистрированы?
+        <RouterLink :to="{ name: 'login-page', query: redirectTarget ? { redirect: redirectTarget } : {} }">
+          Войти
+        </RouterLink>
+      </p>
+    </section>
+  </main>
+</template>

@@ -16,37 +16,50 @@ const router = createRouter({
     {
       path: "/login",
       name: "login-page",
-      component: LoginPage
+      component: LoginPage,
+      meta: { public: true }
     },
     {
       path: "/register",
       name: "reg-page",
-      component: RegisterPage
+      component: RegisterPage,
+      meta: { public: true }
     },
     {
       path: '/create-room',
       name: 'create-room',
       component: CreateRoom,
-      meta: { requiresAuth: true }
     },
     {
       path: '/room/:id',
       name: 'room',
       component: () => import('../views/CodeRoom.vue'),
-      meta: { requiresAuth: true }
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      name: 'not-found',
+      redirect: { name: 'index' }
     },
   ],
 })
 
+// Все маршруты, кроме помеченных meta.public, требуют авторизации.
+// Неавторизованного пользователя отправляем на вход, запоминая исходный путь.
 router.beforeEach((to, from, next) => {
-  const requiresAuth = to.matched.some(record => record.meta.requiresAuth)
+  const authenticated = isLoggedIn()
 
-  if (requiresAuth && !isLoggedIn()) {
+  if (!to.meta.public && !authenticated) {
     next({ name: 'login-page', query: { redirect: to.fullPath } })
-  } else {
-    next()
+    return
   }
-})
 
+  // Залогиненному пользователю незачем видеть страницы входа и регистрации.
+  if (to.meta.public && authenticated) {
+    next({ name: 'index' })
+    return
+  }
+
+  next()
+})
 
 export default router

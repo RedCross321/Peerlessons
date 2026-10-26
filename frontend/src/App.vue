@@ -3,8 +3,7 @@
 </script>
 
 <template>
-  <p>Главная страница</p>
-   <RouterView></RouterView>
+  <RouterView></RouterView>
 </template>
 
 <style scoped></style>

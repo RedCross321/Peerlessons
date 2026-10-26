@@ -1,9 +1,10 @@
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import '@/monaco-workers'
 import * as monaco from 'monaco-editor'
 import { emmetHTML, emmetCSS, emmetJSX } from 'emmet-monaco-es'
-import { getUser, isLoggedIn } from '@/auth'
+import { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -12,6 +13,8 @@ const user = getUser()
 const myUserId = ref(user?.id)
 const myUsername = ref(user?.username || 'Гость')
 const isHost = ref(false)
+const hostId = ref(null)
+const shortRoomId = computed(() => String(roomId || '').slice(0, 8))
 
 const files = ref({
   'index.html': `<!DOCTYPE html>
@@ -41,8 +44,13 @@ document.querySelector("h1").addEventListener("click", () => {
 const activeTab = ref('index.html')
 const canEdit = ref(false)
 const currentEditorName = ref(null)
+const currentEditorId = ref(null)
 const participants = ref([])
 const raisedHands = ref([])
+
+const hasRaisedHand = computed(() =>
+  raisedHands.value.some(h => h.user_id === myUserId.value)
+)
 
 // Предпросмотр
 const showPreview = ref(false)
@@ -52,6 +60,7 @@ const isResizing = ref(false)
 
 // Удалённые курсоры
 const remoteSelections = ref({})
+const remoteCaretWidgets = new Map()
 let decorationsCollection = null
 let editor = null
 let ws = null
@@ -84,6 +93,19 @@ function ensureRemoteStyle(userId, color) {
     }
   `
   document.head.appendChild(style)
+}
+
+// Сериализует выделение и активную позицию курсора для рассылки другим участникам.
+function toRemoteSelection(sel) {
+  return {
+    startLineNumber: sel.startLineNumber,
+    startColumn: sel.startColumn,
+    endLineNumber: sel.endLineNumber,
+    endColumn: sel.endColumn,
+    // Активная граница выделения — именно там рисуется каретка.
+    cursorLineNumber: sel.positionLineNumber,
+    cursorColumn: sel.positionColumn
+  }
 }
 
 function generatePreviewContent() {
@@ -156,14 +178,55 @@ onMounted(async () => {
       console.warn('Language services init failed:', e)
     }
 
+    monaco.editor.defineTheme('peerless-dark', {
+      base: 'vs-dark',
+      inherit: true,
+      rules: [
+        { token: 'comment', foreground: '6d7789', fontStyle: 'italic' },
+        { token: 'keyword', foreground: 'ff9163' },
+        { token: 'string', foreground: 'a9c9a4' },
+        { token: 'number', foreground: 'e8c07d' },
+        { token: 'tag', foreground: 'ff7a45' },
+        { token: 'attribute.name', foreground: 'cdd4e0' },
+        { token: 'attribute.value', foreground: 'a9c9a4' }
+      ],
+      colors: {
+        'editor.background': '#0f1219',
+        'editor.foreground': '#e9edf4',
+        'editorLineNumber.foreground': '#39404f',
+        'editorLineNumber.activeForeground': '#9aa4b6',
+        'editor.lineHighlightBackground': '#151a24',
+        'editor.selectionBackground': '#ff7a4538',
+        'editor.inactiveSelectionBackground': '#ff7a451c',
+        'editorCursor.foreground': '#ff7a45',
+        'editorIndentGuide.background1': '#1c2230',
+        'editorIndentGuide.activeBackground1': '#2c3546',
+        'editorWidget.background': '#121620',
+        'editorWidget.border': '#222a39',
+        'editorSuggestWidget.background': '#121620',
+        'editorSuggestWidget.border': '#222a39',
+        'editorSuggestWidget.selectedBackground': '#1d2432',
+        'scrollbarSlider.background': '#2a324280',
+        'scrollbarSlider.hoverBackground': '#39435a',
+        'scrollbarSlider.activeBackground': '#4a5570'
+      }
+    })
+
     editor = monaco.editor.create(document.getElementById('editor'), {
         value: files.value[activeTab.value],
         language: getLang(activeTab.value),
-        theme: 'vs-dark',
+        theme: 'peerless-dark',
         readOnly: true,
         automaticLayout: true,
         minimap: { enabled: false },
         fontSize: 14,
+        lineHeight: 22,
+        fontFamily: "'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace",
+        padding: { top: 14, bottom: 14 },
+        cursorBlinking: 'smooth',
+        smoothScrolling: true,
+        renderLineHighlight: 'line',
+        scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10 },
         tabSize: 2,
         insertSpaces: true,
 
@@ -189,6 +252,10 @@ onMounted(async () => {
         formatOnType: false,
       })
 
+  // Пересчитываем метрики после загрузки веб-шрифта: иначе Monaco
+  // может остаться на системном фолбэке.
+  document.fonts?.ready.then(() => monaco.editor.remeasureFonts())
+
   decorationsCollection = editor.createDecorationsCollection()
 
   // Изменения кода
@@ -208,15 +275,13 @@ onMounted(async () => {
     const sel = e.selection
     send({
       type: 'cursor-update',
-      selection: {
-        startLineNumber: sel.startLineNumber,
-        startColumn: sel.startColumn,
-        endLineNumber: sel.endLineNumber,
-        endColumn: sel.endColumn
-      },
+      selection: toRemoteSelection(sel),
       color: getUserColor(myUserId.value)
     })
   })
+
+  const tokenReady = await ensureValidAccessToken()
+  if (!tokenReady) return
 
   connectWS()
 })
@@ -224,7 +289,12 @@ onMounted(async () => {
 onUnmounted(() => {
   // ← НОВОЕ: очищаем свой курсор при уходе
   send({ type: 'cursor-clear' })
+  for (const uid of [...remoteCaretWidgets.keys()]) {
+    removeRemoteCaret(uid)
+  }
   editor?.dispose()
+  editor = null
+  decorationsCollection = null
   ws?.close()
   document.removeEventListener('mousemove', onResize)
   document.removeEventListener('mouseup', stopResize)
@@ -236,6 +306,19 @@ function getLang(name) {
   if (name.endsWith('.js')) return 'javascript'
   if (name.endsWith('.py')) return 'python'
   return 'plaintext'
+}
+
+function fileKind(name) {
+  if (name.endsWith('.html') || name.endsWith('.vue')) return 'html'
+  if (name.endsWith('.css')) return 'css'
+  if (name.endsWith('.js')) return 'js'
+  return 'other'
+}
+
+function initials(name) {
+  const parts = String(name || '').trim().split(/[\s_]+/).filter(Boolean)
+  if (!parts.length) return '?'
+  return parts.slice(0, 2).map(part => part[0].toUpperCase()).join('')
 }
 
 function switchTab(name) {
@@ -273,12 +356,7 @@ function switchTab(name) {
       if (sel) {
         send({
           type: 'cursor-update',
-          selection: {
-            startLineNumber: sel.startLineNumber,
-            startColumn: sel.startColumn,
-            endLineNumber: sel.endLineNumber,
-            endColumn: sel.endColumn
-          },
+          selection: toRemoteSelection(sel),
           color: getUserColor(myUserId.value)
         })
       }
@@ -297,12 +375,7 @@ watch(canEdit, (val) => {
       if (sel) {
         send({
           type: 'cursor-update',
-          selection: {
-            startLineNumber: sel.startLineNumber,
-            startColumn: sel.startColumn,
-            endLineNumber: sel.endLineNumber,
-            endColumn: sel.endColumn
-          },
+          selection: toRemoteSelection(sel),
           color: getUserColor(myUserId.value)
         })
       }
@@ -335,6 +408,7 @@ function connectWS() {
       if (data.showPreview) previewKey.value++
 
       // Кто сейчас редактирует
+      currentEditorId.value = data.currentEditor?.user_id ?? null
       if (data.currentEditor) {
         currentEditorName.value = data.currentEditor.username
         canEdit.value = data.currentEditor.user_id === myUserId.value
@@ -345,6 +419,7 @@ function connectWS() {
 
       // Хост
       isHost.value = data.hostId === myUserId.value || data.isHost === true
+      hostId.value = data.hostId ?? null
 
       // Участники
       if (data.participants) {
@@ -410,6 +485,7 @@ function connectWS() {
 
     if (data.type === 'editor-changed') {
       currentEditorName.value = data.username
+      currentEditorId.value = data.user_id
       canEdit.value = data.user_id === myUserId.value
     }
 
@@ -420,12 +496,17 @@ function connectWS() {
     // ← НОВОЕ: сервер может присылать isHost
     if (data.type === 'host-info') {
       isHost.value = data.hostId === myUserId.value
+      hostId.value = data.hostId ?? null
     }
 
     if (data.type === 'hand-raised') {
       if (!raisedHands.value.find(h => h.user_id === data.user_id)) {
         raisedHands.value.push({ user_id: data.user_id, username: data.username })
       }
+    }
+
+    if (data.type === 'hand-lowered') {
+      raisedHands.value = raisedHands.value.filter(h => h.user_id !== data.user_id)
     }
 
     // ← ИЗМЕНЕНО: предпросмотр синхронизируется у всех
@@ -482,28 +563,104 @@ function send(data) {
 }
 
 // ===== Декорации курсоров =====
+function getRemoteCursorPosition(selection) {
+  return {
+    lineNumber: selection.cursorLineNumber ?? selection.endLineNumber,
+    column: selection.cursorColumn ?? selection.endColumn
+  }
+}
+
+function ensureRemoteCaret(uid, username, color, position) {
+  let entry = remoteCaretWidgets.get(uid)
+
+  if (!entry) {
+    const node = document.createElement('div')
+    node.className = 'remote-caret'
+    node.style.width = '2px'
+    node.style.pointerEvents = 'none'
+    node.style.zIndex = '10'
+    node.style.borderRadius = '1px'
+
+    const widget = {
+      getId: () => `remote-caret-${uid}`,
+      getDomNode: () => node,
+      getPosition: () => {
+        if (!entry.position) return null
+        return {
+          position: entry.position,
+          preference: [monaco.editor.ContentWidgetPositionPreference.EXACT]
+        }
+      }
+    }
+
+    entry = { node, widget, position: null }
+    remoteCaretWidgets.set(uid, entry)
+    editor.addContentWidget(widget)
+  }
+
+  const lineHeight =
+    editor.getOption(monaco.editor.EditorOption.lineHeight) || 18
+
+  entry.position = position
+  entry.node.style.height = `${lineHeight}px`
+  entry.node.style.background = color
+  entry.node.title = `${username}`
+
+  editor.layoutContentWidget(entry.widget)
+}
+
+function removeRemoteCaret(uid) {
+  const entry = remoteCaretWidgets.get(uid)
+  if (!entry) return
+  if (editor) editor.removeContentWidget(entry.widget)
+  remoteCaretWidgets.delete(uid)
+}
+
 function updateRemoteDecorations() {
   if (!editor || !decorationsCollection) return
 
   const newDecorations = []
+  const withCursor = new Set()
 
   for (const [uid, info] of Object.entries(remoteSelections.value)) {
     if (!info.selection) continue
 
-    newDecorations.push({
-      range: new monaco.Range(
-        info.selection.startLineNumber,
-        info.selection.startColumn,
-        info.selection.endLineNumber,
-        info.selection.endColumn
-      ),
-      options: {
-        className: `remote-selection-${uid}`,
-        inlineClassName: `remote-selection-${uid}-inline`,
-        hoverMessage: { value: `**${info.username}**` },
-        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
-      }
-    })
+    const sel = info.selection
+    withCursor.add(uid)
+
+    // Подсветка нужна только для непустого выделения.
+    if (
+      sel.startLineNumber !== sel.endLineNumber ||
+      sel.startColumn !== sel.endColumn
+    ) {
+      newDecorations.push({
+        range: new monaco.Range(
+          sel.startLineNumber,
+          sel.startColumn,
+          sel.endLineNumber,
+          sel.endColumn
+        ),
+        options: {
+          className: `remote-selection-${uid}`,
+          inlineClassName: `remote-selection-${uid}-inline`,
+          hoverMessage: { value: `**${info.username}**` },
+          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
+        }
+      })
+    }
+
+    // Каретка видна всегда, даже когда выделения нет.
+    ensureRemoteCaret(
+      uid,
+      info.username,
+      info.color,
+      getRemoteCursorPosition(sel)
+    )
+  }
+
+  // Убираем каретки пользователей, чей курсор больше не актуален.
+  for (const uid of [...remoteCaretWidgets.keys()]) {
+    if (!withCursor.has(uid)) removeRemoteCaret(uid)
   }
 
   decorationsCollection.set(newDecorations)
@@ -521,7 +678,7 @@ function startResize(e) {
 
 function onResize(e) {
   if (!isResizing.value) return
-  const newWidth = window.innerWidth - e.clientX - 260
+  const newWidth = window.innerWidth - e.clientX - 300
   if (newWidth >= 250 && newWidth <= window.innerWidth - 500) {
     previewWidth.value = newWidth
   }
@@ -552,6 +709,11 @@ function raiseHand() {
   send({ type: 'raise-hand', user_id: myUserId.value, username: myUsername.value })
 }
 
+function lowerHand() {
+  send({ type: 'lower-hand' })
+  raisedHands.value = raisedHands.value.filter(h => h.user_id !== myUserId.value)
+}
+
 function grantEdit(userId) {
   send({ type: 'grant-edit', user_id: userId })
   raisedHands.value = raisedHands.value.filter(h => h.user_id !== userId)
@@ -563,284 +725,599 @@ function revokeEdit() {
 </script>
 
 <template>
-  <div class="layout">
-    <!-- Toolbar -->
-    <div class="toolbar">
-      <div class="tabs">
-        <button
-          v-for="(_, name) in files"
-          :key="name"
-          :class="['tab', { active: name === activeTab }]"
-          @click="switchTab(name)"
-        >
-          {{ name }}
-        </button>
-      </div>
-
-      <div class="actions-toolbar">
-        <button v-if="canEdit" class="btn-preview" @click="togglePreview">
-          {{ showPreview ? 'Скрыть предпросмотр' : '👁 Запустить код' }}
-        </button>
-        <button v-if="showPreview" class="btn-refresh" @click="refreshPreview" title="Обновить предпросмотр">
-          🔄 Обновить
-        </button>
-
-        <div class="info">
-          <span v-if="currentEditorName">Редактирует: <b>{{ currentEditorName }}</b></span>
-          <span v-else>Режим просмотра</span>
-          <span v-if="canEdit" class="badge">Вы редактируете</span>
+  <div class="room">
+    <header class="room-header">
+      <div class="room-identity">
+        <RouterLink to="/" class="brand brand--compact">
+          <span class="brand-mark">/</span>
+          <span class="brand-name">Peerlessons</span>
+        </RouterLink>
+        <span class="room-sep"></span>
+        <div class="room-meta">
+          <span class="room-title">Комната</span>
+          <span class="room-id">{{ shortRoomId }}</span>
         </div>
       </div>
-    </div>
 
-    <!-- Main -->
-    <div class="main">
-      <div id="editor" class="editor"></div>
-
-      <div v-if="showPreview" class="resizer" @mousedown="startResize"></div>
-
-      <div v-if="showPreview" class="preview-container" :style="{ width: previewWidth + 'px' }">
-        <div class="preview-header">
-          <span>Результат</span>
-          <button class="btn-close-preview" @click="togglePreview">×</button>
-        </div>
-        <iframe
-          :key="previewKey"
-          :srcdoc="generatePreviewContent()"
-          sandbox="allow-scripts allow-modals allow-forms allow-same-origin"
-          class="preview-frame"
-          title="Code Preview"
-        ></iframe>
+      <div class="room-status">
+        <span class="status-dot" :class="{ edit: canEdit }"></span>
+        <span v-if="currentEditorName" class="status-text">
+          Редактирует <b>{{ currentEditorName }}</b>
+        </span>
+        <span v-else class="status-text">Режим просмотра</span>
+        <span v-if="canEdit" class="badge badge-accent">Вы редактируете</span>
       </div>
+    </header>
 
-      <!-- Sidebar -->
-      <div class="sidebar">
-        <h3>Участники ({{ participants.length }})</h3>
-        <ul>
-          <li v-for="p in participants" :key="p.user_id">
-            {{ p.username }}
-            <span v-if="p.user_id === myUserId"> (вы)</span>
-            <span v-if="p.isHost" class="host-badge">хост</span>
-          </li>
-        </ul>
-
-        <div v-if="raisedHands.length" class="hands">
-          <h4>Подняли руку ✋</h4>
-          <div v-for="h in raisedHands" :key="h.user_id" class="hand-item">
-            <span>{{ h.username }}</span>
+    <div class="workspace">
+      <section class="editor-panel">
+        <div class="editor-toolbar">
+          <div class="tabs">
             <button
-              v-if="isHost"
-              @click="grantEdit(h.user_id)"
-              class="btn btn-sm btn-success"
+              v-for="(_, name) in files"
+              :key="name"
+              :class="['tab', { active: name === activeTab }]"
+              @click="switchTab(name)"
             >
-              Дать права
+              <span class="tab-dot" :class="fileKind(name)"></span>
+              {{ name }}
+            </button>
+          </div>
+
+          <div class="toolbar-actions">
+            <button v-if="canEdit" class="btn btn-secondary btn-sm" @click="togglePreview">
+              {{ showPreview ? 'Скрыть результат' : 'Запустить код' }}
+            </button>
+            <button
+              v-if="showPreview"
+              class="btn btn-ghost btn-sm"
+              @click="refreshPreview"
+              title="Обновить предпросмотр"
+            >
+              Обновить
             </button>
           </div>
         </div>
 
-        <div class="actions">
-          <button v-if="!canEdit" @click="raiseHand" class="btn">Поднять руку</button>
-          <button v-if="canEdit" @click="revokeEdit" class="btn danger">Завершить редактирование</button>
+        <div class="editor-area">
+          <div id="editor" class="editor"></div>
+
+          <div v-if="showPreview" class="resizer" @mousedown="startResize"></div>
+
+          <div v-if="showPreview" class="preview-container" :style="{ width: previewWidth + 'px' }">
+            <div class="preview-header">
+              <span class="preview-title"><span class="preview-dot"></span> Результат</span>
+              <button v-if="canEdit" class="icon-btn" @click="togglePreview" title="Закрыть">×</button>
+            </div>
+            <iframe
+              :key="previewKey"
+              :srcdoc="generatePreviewContent()"
+              sandbox="allow-scripts allow-modals allow-forms allow-same-origin"
+              class="preview-frame"
+              title="Code Preview"
+            ></iframe>
+          </div>
         </div>
-      </div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="side-card">
+          <h3 class="side-title">
+            Участники
+            <span class="count">{{ participants.length }}</span>
+          </h3>
+          <ul class="participant-list">
+            <li v-for="p in participants" :key="p.user_id" class="participant">
+              <span
+                class="avatar"
+                :style="{ color: getUserColor(p.user_id), background: getUserColor(p.user_id) + '1f' }"
+              >
+                {{ initials(p.username) }}
+              </span>
+              <span class="participant-name">
+                {{ p.username }}<span v-if="p.user_id === myUserId" class="you">вы</span>
+              </span>
+              <span
+                v-if="p.user_id === currentEditorId"
+                class="editing-dot"
+                title="Редактирует сейчас"
+              ></span>
+              <span v-if="p.user_id === hostId" class="tag">хост</span>
+            </li>
+          </ul>
+        </section>
+
+        <section v-if="raisedHands.length" class="side-card">
+          <h3 class="side-title">
+            Подняли руку
+            <span class="count">{{ raisedHands.length }}</span>
+          </h3>
+          <div class="hand-list">
+            <div v-for="h in raisedHands" :key="h.user_id" class="hand-item">
+              <span class="hand-name">{{ h.username }}</span>
+              <button
+                v-if="isHost"
+                @click="grantEdit(h.user_id)"
+                class="btn btn-primary btn-xs"
+              >
+                Дать права
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <div class="side-actions">
+          <button v-if="isHost && !canEdit" @click="revokeEdit" class="btn btn-primary">Вернуть права</button>
+          <button v-if="!isHost && hasRaisedHand" @click="lowerHand" class="btn btn-secondary">Опустить руку</button>
+          <button v-if="!isHost && !hasRaisedHand && !canEdit" @click="raiseHand" class="btn btn-secondary">Поднять руку</button>
+          <button v-if="!isHost && canEdit" @click="revokeEdit" class="btn btn-danger">Завершить редактирование</button>
+        </div>
+      </aside>
     </div>
   </div>
 </template>
 
 <style scoped>
-.layout {
+.room {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: #1e1e1e;
-  color: #ddd;
+  background: var(--bg);
+  color: var(--text);
   overflow: hidden;
 }
 
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 12px;
-  background: #252526;
-  border-bottom: 1px solid #333;
+.room-header {
+  height: 64px;
   flex-shrink: 0;
-}
-
-.tabs { display: flex; gap: 4px; }
-
-.tab {
-  background: #2d2d2d;
-  border: none;
-  color: #aaa;
-  padding: 6px 12px;
-  border-radius: 4px 4px 0 0;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-.tab:hover { background: #3e3e42; }
-.tab.active {
-  background: #1e1e1e;
-  color: #fff;
-  border-bottom: 2px solid #0e639c;
-}
-
-.actions-toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 20px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
 }
 
-.btn-preview {
-  background: #28a745;
-  color: white;
-  border: none;
-  padding: 6px 16px;
-  border-radius: 4px;
-  cursor: pointer;
+.room-identity {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.room-sep {
+  width: 1px;
+  height: 24px;
+  background: var(--border);
+}
+
+.room-meta {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.room-title {
+  color: var(--text-muted);
+  font-size: 12px;
   font-weight: 600;
-  transition: background 0.2s;
 }
-.btn-preview:hover { background: #218838; }
 
-.btn-refresh {
-  background: #17a2b8;
-  color: white;
-  border: none;
-  padding: 6px 12px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 14px;
-  transition: background 0.2s;
-}
-.btn-refresh:hover { background: #138496; }
-
-.info { font-size: 14px; display: flex; align-items: center; gap: 12px; }
-
-.badge {
-  background: #0e639c;
-  padding: 2px 8px;
-  border-radius: 4px;
+.room-id {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
-.host-badge {
-  background: #e5c07b;
-  color: #1e1e1e;
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  margin-left: 6px;
+.room-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
-.main {
+.status-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.status-dot.edit {
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+.status-text {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.status-text b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.workspace {
   flex: 1;
   display: flex;
-  overflow: hidden;
+  min-height: 0;
+}
+
+.editor-panel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #0f1219;
+}
+
+.editor-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs {
+  display: flex;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+
+.tab:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.tab.active {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.tab-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.tab-dot.html {
+  background: #e8734a;
+}
+
+.tab-dot.css {
+  background: #5b8def;
+}
+
+.tab-dot.js {
+  background: #e5c07b;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.editor-area {
+  flex: 1;
+  display: flex;
+  min-height: 0;
   position: relative;
 }
 
 .editor {
   flex: 1;
-  min-width: 300px;
+  min-width: 0;
 }
 
 .resizer {
-  width: 8px;
-  background: #1e1e1e;
-  border-left: 1px solid #333;
-  border-right: 1px solid #333;
-  cursor: col-resize;
-  transition: background 0.2s;
+  width: 6px;
   flex-shrink: 0;
   z-index: 10;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  cursor: col-resize;
+  transition: background-color 0.16s ease;
 }
-.resizer:hover, .resizer:active {
-  background: #0e639c;
+
+.resizer:hover,
+.resizer:active {
+  background: var(--accent);
 }
 
 .preview-container {
-  background: #ffffff;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid #333;
-  flex-shrink: 0;
+  min-width: 250px;
+  background: #fff;
+  border-left: 1px solid var(--border);
 }
 
 .preview-header {
-  background: #f0f0f0;
-  color: #333;
-  padding: 8px 12px;
-  font-size: 13px;
-  font-weight: bold;
-  border-bottom: 1px solid #ccc;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #f4f5f7;
+  border-bottom: 1px solid #dfe2e8;
+  color: #3a4150;
 }
 
-.btn-close-preview {
-  background: #dc3545;
-  color: white;
-  border: none;
-  width: 24px;
-  height: 24px;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 16px;
-  line-height: 1;
-  display: flex;
+.preview-title {
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
 }
-.btn-close-preview:hover { background: #c82333; }
+
+.preview-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4caf72;
+}
+
+.icon-btn {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #d7dbe3;
+  border-radius: 7px;
+  background: transparent;
+  color: #4a5160;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.icon-btn:hover {
+  background: #e7e9ee;
+  border-color: #c3c8d2;
+  color: #191c23;
+}
 
 .preview-frame {
   width: 100%;
   height: 100%;
-  border: none;
-  background: white;
+  border: 0;
+  background: #fff;
 }
 
 .sidebar {
-  width: 260px;
-  min-width: 260px;
-  background: #252526;
-  border-left: 1px solid #333;
+  width: 288px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
   padding: 16px;
   overflow-y: auto;
-  flex-shrink: 0;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
 }
 
-.sidebar ul { list-style: none; padding: 0; margin-top: 12px; }
-.sidebar li { padding: 6px 0; border-bottom: 1px solid #333; }
+.side-card {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
 
-.hands { margin-top: 20px; }
+.side-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.participant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.participant {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+  border-radius: 8px;
+}
+
+.participant:hover {
+  background: var(--surface-2);
+}
+
+.avatar {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.participant-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.editing-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.you {
+  margin-left: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.tag {
+  padding: 2px 6px;
+  border: 1px solid rgba(255, 122, 69, 0.3);
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.hand-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .hand-item {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin: 8px 0;
-  font-size: 14px;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13.5px;
 }
 
-.actions { margin-top: 24px; display: flex; flex-direction: column; gap: 8px; }
+.hand-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 
-.btn {
+.side-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.side-actions .btn {
   width: 100%;
-  padding: 10px;
-  border: none;
-  border-radius: 6px;
-  background: #0e639c;
-  color: white;
-  cursor: pointer;
-  font-weight: 500;
 }
-.btn:hover { background: #1177bb; }
-.btn.danger { background: #a1260d; }
-.btn.danger:hover { background: #c7361a; }
-.btn.btn-sm { padding: 4px 10px; font-size: 12px; width: auto; }
-.btn-success { background: #28a745; }
-.btn-success:hover { background: #218838; }
+
+@media (max-width: 900px) {
+  .room {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .workspace {
+    flex-direction: column;
+  }
+
+  .editor-panel {
+    min-height: 60vh;
+  }
+
+  .editor-area {
+    flex-direction: column;
+    min-height: 70vh;
+  }
+
+  .preview-container {
+    width: 100% !important;
+    min-height: 45vh;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .resizer {
+    display: none;
+  }
+
+  .sidebar {
+    width: auto;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .room-header {
+    height: auto;
+    padding: 12px 16px;
+    flex-wrap: wrap;
+  }
+
+  .room-status {
+    width: 100%;
+  }
+}
 </style>

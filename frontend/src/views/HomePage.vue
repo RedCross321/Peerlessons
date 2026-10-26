@@ -1,31 +1,52 @@
 <script setup>
-import { ref, onMounted } from 'vue';
-import api from '@/auth';
+import { useRouter } from 'vue-router'
+import { getUser, logout } from '@/auth'
 
-const message = ref("")
-const error = ref("")
+const router = useRouter()
+const username = getUser()?.username || 'участник'
 
-const fetchGreeting = async () => {
-  try {
-    const response = await api.get('/')
-    message.value = response.data.text || response.data.message || 'Добро пожаловать'
-  } catch(err) {
-    console.error(err)
-    error.value = "Ошибка при обращении к API: " + (err.response?.data?.detail || err.message)
-  }
+function handleLogout() {
+  logout()
+  router.replace({ name: 'login-page' })
 }
-
-onMounted(() => fetchGreeting())
 </script>
 
 <template>
-  <div class="container mt-5 text-center">
-    <h1>Главная страница</h1>
-    <p v-if="message" class="lead">{{ message }}</p>
-    <p v-if="error" class="text-danger">{{ error }}</p>
+  <main class="page">
+    <div class="home-inner">
+      <div class="home-brand">
+        <span class="brand">
+          <span class="brand-mark">/</span>
+          <span class="brand-name">Peerlessons</span>
+        </span>
+      </div>
 
-    <div class="mt-4" v-if="!error">
-      <RouterLink to="/create-room" class="btn btn-primary btn-lg">Создать новую комнату</RouterLink>
+      <span class="home-rule"></span>
+
+      <h1 class="home-title">
+        Пишите код <span>вместе</span>,<br>
+        прямо сейчас
+      </h1>
+
+      <p class="home-lead">
+        Создайте комнату и делитесь редактором в реальном времени — без установки
+        и лишних настроек.
+      </p>
+
+      <div class="home-actions">
+        <RouterLink to="/create-room" class="btn btn-primary btn-lg">
+          Создать комнату
+        </RouterLink>
+        <button
+          type="button"
+          class="btn btn-ghost btn-lg btn-logout"
+          @click="handleLogout"
+        >
+          Выйти из аккаунта
+        </button>
+      </div>
+
+      <p class="home-note">Вы вошли как <b>{{ username }}</b></p>
     </div>
-  </div>
+  </main>
 </template>
