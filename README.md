@@ -1,5 +1,3 @@
-# Peerlessons
-
 <div align="center">
 
 # Peerlessons
