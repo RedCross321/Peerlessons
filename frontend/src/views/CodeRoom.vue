@@ -5,6 +5,7 @@ import '@/monaco-workers'
 import * as monaco from 'monaco-editor'
 import { emmetHTML, emmetCSS, emmetJSX } from 'emmet-monaco-es'
 import { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
+import { setPageSeo } from '@/utils/seo'
 
 const route = useRoute()
 const router = useRouter()
@@ -15,6 +16,15 @@ const myUsername = ref(user?.username || 'Гость')
 const isHost = ref(false)
 const hostId = ref(null)
 const shortRoomId = computed(() => String(roomId || '').slice(0, 8))
+
+setPageSeo({
+  title: 'Комната — Peerlessons',
+  description:
+    'Приватная комната совместного редактирования кода в Peerlessons.',
+  path: `/room/${roomId}`,
+  robots: 'noindex, nofollow',
+  canonical: false,
+})
 
 const files = ref({
   'index.html': `<!DOCTYPE html>
@@ -46,6 +56,8 @@ const canEdit = ref(false)
 const currentEditorName = ref(null)
 const currentEditorId = ref(null)
 const participants = ref([])
+const participantsVersion = ref(-1)
+const connectionStatus = ref('connecting') // connecting | reconnecting | online
 const raisedHands = ref([])
 
 const hasRaisedHand = computed(() =>
@@ -55,6 +67,8 @@ const hasRaisedHand = computed(() =>
 // Предпросмотр
 const showPreview = ref(false)
 const previewKey = ref(0)
+const previewHtml = ref('')
+const PREVIEW_DEBOUNCE_MS = 600
 const previewWidth = ref(400)
 const isResizing = ref(false)
 
@@ -64,6 +78,11 @@ const remoteCaretWidgets = new Map()
 let decorationsCollection = null
 let editor = null
 let ws = null
+let wsGeneration = 0
+let reconnectTimer = null
+let reconnectAttempt = 0
+let shouldReconnect = true
+let previewTimer = null
 let ignoreChanges = false
 
 // ===== Утилиты =====
@@ -122,6 +141,71 @@ function generatePreviewContent() {
     `<script>\n${js}\n<\/script>`
   )
   return html
+}
+
+// Применяет изменения кода минимальной правкой, не сбрасывая скролл и модель.
+function applyRemoteCode(nextValue) {
+  if (!editor) return
+
+  const model = editor.getModel()
+  if (!model) return
+
+  const currentValue = model.getValue()
+  if (currentValue === nextValue) return
+
+  let start = 0
+  const maxStart = Math.min(currentValue.length, nextValue.length)
+
+  while (start < maxStart && currentValue[start] === nextValue[start]) {
+    start += 1
+  }
+
+  let endOld = currentValue.length
+  let endNew = nextValue.length
+
+  while (
+    endOld > start &&
+    endNew > start &&
+    currentValue[endOld - 1] === nextValue[endNew - 1]
+  ) {
+    endOld -= 1
+    endNew -= 1
+  }
+
+  const startPos = model.getPositionAt(start)
+  const endPos = model.getPositionAt(endOld)
+
+  ignoreChanges = true
+
+  try {
+    model.applyEdits([
+      {
+        range: new monaco.Range(
+          startPos.lineNumber,
+          startPos.column,
+          endPos.lineNumber,
+          endPos.column
+        ),
+        text: nextValue.slice(start, endNew),
+        forceMoveMarkers: true
+      }
+    ])
+  } finally {
+    ignoreChanges = false
+  }
+}
+
+function updatePreviewNow(force = false) {
+  clearTimeout(previewTimer)
+  previewHtml.value = generatePreviewContent()
+  if (force) previewKey.value++
+}
+
+function schedulePreviewUpdate() {
+  if (!showPreview.value) return
+
+  clearTimeout(previewTimer)
+  previewTimer = setTimeout(() => updatePreviewNow(), PREVIEW_DEBOUNCE_MS)
 }
 
 // ===== Инициализация =====
@@ -280,13 +364,15 @@ onMounted(async () => {
     })
   })
 
-  const tokenReady = await ensureValidAccessToken()
-  if (!tokenReady) return
-
-  connectWS()
+  await connectWS()
 })
 
 onUnmounted(() => {
+  shouldReconnect = false
+  wsGeneration += 1
+  clearTimeout(reconnectTimer)
+  clearTimeout(previewTimer)
+
   // ← НОВОЕ: очищаем свой курсор при уходе
   send({ type: 'cursor-clear' })
   for (const uid of [...remoteCaretWidgets.keys()]) {
@@ -296,6 +382,7 @@ onUnmounted(() => {
   editor = null
   decorationsCollection = null
   ws?.close()
+  ws = null
   document.removeEventListener('mousemove', onResize)
   document.removeEventListener('mouseup', stopResize)
 })
@@ -386,16 +473,37 @@ watch(canEdit, (val) => {
   }
 })
 
-function connectWS() {
+// Предпросмотр обновляем только после паузы, а не на каждый символ.
+watch(files, schedulePreviewUpdate, { deep: true })
+
+async function connectWS() {
+  if (!shouldReconnect) return
+
+  clearTimeout(reconnectTimer)
+
+  const generation = ++wsGeneration
+  // Новая сессия — версию сбрасываем: сервер мог перезапуститься.
+  participantsVersion.value = -1
+  connectionStatus.value = reconnectAttempt > 0 ? 'reconnecting' : 'connecting'
+
+  const tokenReady = await ensureValidAccessToken()
+  if (!tokenReady || generation !== wsGeneration || !shouldReconnect) return
+
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
   const token = localStorage.getItem('token')
   const url = `${protocol}://${location.host}/ws/room/${roomId}?token=${token}`
 
-  ws = new WebSocket(url)
+  const socket = new WebSocket(url)
+  ws = socket
 
-  ws.onopen = () => console.log('WS подключён')
+  socket.onopen = () => {
+    if (generation !== wsGeneration) return
+    console.log('WS подключён')
+  }
 
-  ws.onmessage = (e) => {
+  socket.onmessage = (e) => {
+    if (generation !== wsGeneration) return
+
     const data = JSON.parse(e.data)
 
     // ========== ← НОВОЕ: полное состояние комнаты при подключении ==========
@@ -405,7 +513,7 @@ function connectWS() {
       files.value = data.files || files.value
       activeTab.value = data.activeTab || activeTab.value
       showPreview.value = !!data.showPreview
-      if (data.showPreview) previewKey.value++
+      if (data.showPreview) updatePreviewNow(true)
 
       // Кто сейчас редактирует
       currentEditorId.value = data.currentEditor?.user_id ?? null
@@ -421,9 +529,11 @@ function connectWS() {
       isHost.value = data.hostId === myUserId.value || data.isHost === true
       hostId.value = data.hostId ?? null
 
-      // Участники
-      if (data.participants) {
+      // Участники — только если версия не старше уже применённой
+      const version = data.participantsVersion ?? 0
+      if (Array.isArray(data.participants) && version >= participantsVersion.value) {
         participants.value = data.participants
+        participantsVersion.value = version
       }
 
       // Поднятые руки
@@ -464,23 +574,26 @@ function connectWS() {
       }
 
       ignoreChanges = false
+      connectionStatus.value = 'online'
+      reconnectAttempt = 0
       return
     }
 
     // Обычное обновление кода
     if (data.type === 'code-update') {
-      ignoreChanges = true
       files.value = data.files || files.value
       activeTab.value = data.activeTab || activeTab.value
 
       if (editor) {
         const newVal = files.value[activeTab.value] || ''
-        if (editor.getValue() !== newVal) {
-          editor.setValue(newVal)
+        applyRemoteCode(newVal)
+
+        const model = editor.getModel()
+        const lang = getLang(activeTab.value)
+        if (model && model.getLanguageId() !== lang) {
+          monaco.editor.setModelLanguage(model, lang)
         }
-        monaco.editor.setModelLanguage(editor.getModel(), getLang(activeTab.value))
       }
-      ignoreChanges = false
     }
 
     if (data.type === 'editor-changed') {
@@ -490,7 +603,11 @@ function connectWS() {
     }
 
     if (data.type === 'participants') {
-      participants.value = data.list || []
+      const version = typeof data.version === 'number' ? data.version : 0
+      if (version >= participantsVersion.value) {
+        participants.value = data.list || []
+        participantsVersion.value = version
+      }
     }
 
     // ← НОВОЕ: сервер может присылать isHost
@@ -512,11 +629,11 @@ function connectWS() {
     // ← ИЗМЕНЕНО: предпросмотр синхронизируется у всех
     if (data.type === 'preview-toggle') {
       showPreview.value = data.show
-      if (data.show) previewKey.value++
+      if (data.show) updatePreviewNow(true)
     }
 
     if (data.type === 'preview-refresh') {
-      previewKey.value++
+      updatePreviewNow(true)
     }
 
     // Курсор другого пользователя
@@ -549,11 +666,31 @@ function connectWS() {
     }
   }
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (generation !== wsGeneration) return
+
     console.log('WS отключён')
     remoteSelections.value = {}
     updateRemoteDecorations()
+    ws = null
+
+    if (!shouldReconnect) return
+    scheduleReconnect()
   }
+}
+
+function scheduleReconnect() {
+  if (!shouldReconnect) return
+
+  reconnectAttempt += 1
+  connectionStatus.value = 'reconnecting'
+
+  const delay = Math.min(1000 * 2 ** Math.min(reconnectAttempt - 1, 4), 10_000)
+
+  clearTimeout(reconnectTimer)
+  reconnectTimer = setTimeout(() => {
+    connectWS().catch(() => scheduleReconnect())
+  }, delay)
 }
 
 function send(data) {
@@ -696,12 +833,12 @@ function stopResize() {
 // ===== Действия =====
 function togglePreview() {
   showPreview.value = !showPreview.value
+  if (showPreview.value) updatePreviewNow(true)
   send({ type: 'preview-toggle', show: showPreview.value })
-  if (showPreview.value) previewKey.value++
 }
 
 function refreshPreview() {
-  previewKey.value++
+  updatePreviewNow(true)
   send({ type: 'preview-refresh' })
 }
 
@@ -791,7 +928,7 @@ function revokeEdit() {
             </div>
             <iframe
               :key="previewKey"
-              :srcdoc="generatePreviewContent()"
+              :srcdoc="previewHtml"
               sandbox="allow-scripts allow-modals allow-forms allow-same-origin"
               class="preview-frame"
               title="Code Preview"
@@ -853,6 +990,22 @@ function revokeEdit() {
           <button v-if="!isHost && canEdit" @click="revokeEdit" class="btn btn-danger">Завершить редактирование</button>
         </div>
       </aside>
+    </div>
+
+    <div
+      v-if="connectionStatus !== 'online'"
+      class="room-overlay"
+      role="status"
+      aria-live="polite"
+    >
+      <div class="room-overlay-card">
+        <span class="spinner" aria-hidden="true"></span>
+        <p class="room-overlay-text">
+          {{ connectionStatus === 'reconnecting'
+            ? 'Соединение потеряно. Переподключаемся…'
+            : 'Подключаемся к комнате…' }}
+        </p>
+      </div>
     </div>
   </div>
 </template>
@@ -1319,5 +1472,34 @@ function revokeEdit() {
   .room-status {
     width: 100%;
   }
+}
+
+.room-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(9, 11, 16, 0.82);
+}
+
+.room-overlay-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.room-overlay-card .spinner {
+  color: var(--accent);
+}
+
+.room-overlay-text {
+  color: var(--text-muted);
+  font-size: 14px;
 }
 </style>

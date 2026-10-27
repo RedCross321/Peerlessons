@@ -161,6 +161,7 @@ class ConnectionManager:
                 "cursors": {},          # user_id -> {username, selection, color}
                 "raisedHands": [],      # [{user_id, username}]
                 "currentEditorId": None,  # актуальный редактор для всех соединений
+                "participantsVersion": 0,
             }
         return self.room_state[room_id]
 
@@ -192,8 +193,17 @@ class ConnectionManager:
                 p for p in self.rooms[room_id] if p["websocket"] != websocket
             ]
 
-            # ← НОВОЕ: чистим курсор и руку ушедшего
-            if left_user_id is not None and room_id in self.room_state:
+            still_connected = left_user_id is not None and any(
+                p["user_id"] == left_user_id for p in self.rooms[room_id]
+            )
+
+            # Чистим состояние только если у пользователя не осталось
+            # других соединений (например, старая вкладка при refresh).
+            if (
+                left_user_id is not None
+                and not still_connected
+                and room_id in self.room_state
+            ):
                 state = self.room_state[room_id]
                 state["cursors"].pop(str(left_user_id), None)
                 state["raisedHands"] = [
@@ -202,15 +212,38 @@ class ConnectionManager:
 
             if not self.rooms[room_id]:
                 del self.rooms[room_id]
-                self.room_state.pop(room_id, None)  # ← НОВОЕ
+                self.room_state.pop(room_id, None)
+
+            # Если у пользователя осталось другое соединение (refresh/
+            # вторая вкладка), не считаем его вышедшим.
+            if still_connected:
+                return None
 
         return left_user_id
 
     def get_participants(self, room_id: str) -> list[dict[str, Any]]:
-        return [
-            {"user_id": p["user_id"], "username": p["username"]}
-            for p in self.rooms.get(room_id, [])
-        ]
+        seen: set[int] = set()
+        participants: list[dict[str, Any]] = []
+
+        for p in self.rooms.get(room_id, []):
+            user_id = p["user_id"]
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            participants.append({"user_id": user_id, "username": p["username"]})
+
+        return participants
+
+    def build_participants(self, room_id: str) -> dict[str, Any]:
+        """Атомарно увеличивает версию и снимает актуальный список."""
+        state = self._ensure_state(room_id)
+        state["participantsVersion"] += 1
+
+        return {
+            "type": "participants",
+            "version": state["participantsVersion"],
+            "list": self.get_participants(room_id),
+        }
 
     async def broadcast(
         self, room_id: str, message: dict[str, Any], exclude: WebSocket | None = None
@@ -416,312 +449,377 @@ def get_room(room_id: UUID, db: DbSession) -> Room:
     return room
 
 
-@app.websocket("/ws/room/{room_id}")
-async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> None:
-    token = websocket.query_params.get("token")
-    try:
-        user = get_websocket_user(token, db)
-    except HTTPException as e:
-        logger.warning(f"Неудачная попытка подключения к WebSocket: {e.detail}")
-        await websocket.close(
-            code=status.WS_1008_POLICY_VIOLATION, reason="Unauthorized"
-        )
-        return
+class RoomSession:
+    """Состояние и обработчики одного WebSocket-соединения в комнате."""
 
-    room = db.query(Room).filter(Room.id == room_id).first()
-    if not room:
-        await websocket.close(code=4004, reason="Room not found")
-        return
+    def __init__(self, websocket: WebSocket, room_id: str, db: Session) -> None:
+        self.websocket = websocket
+        self.room_id = room_id
+        self.db = db
+        self.user: User | None = None
+        self.room: Room | None = None
+        self.state: dict[str, Any] = {}
 
-    await manager.connect(room_id, websocket, user.id, user.username or "Участник")
-    state = manager._ensure_state(room_id)
-    # Сессия БД у каждого WebSocket своя и видит только своё состояние,
-    # поэтому текущего редактора держим в общем состоянии комнаты.
-    if state.get("currentEditorId") is None:
-        state["currentEditorId"] = room.current_editor_id
+    @property
+    def user_id(self) -> int:
+        assert self.user is not None
+        return self.user.id
 
-    # ===== ← НОВОЕ: отправляем ПОЛНОЕ состояние комнаты новичку =====
-    current_code = room.current_code if isinstance(room.current_code, dict) else {}
-    participants = manager.get_participants(room_id)
+    @property
+    def username(self) -> str:
+        assert self.user is not None
+        return self.user.username or "Участник"
 
-    # Имя текущего редактора
-    editor_id = state.get("currentEditorId")
-    editor_username = next(
-        (p["username"] for p in participants if p["user_id"] == editor_id),
-        None,
-    )
+    @property
+    def current_room(self) -> Room:
+        assert self.room is not None
+        return self.room
 
-    await websocket.send_json({
-        "type": "room-state",
-        "files": current_code.get("files", {}),
-        "activeTab": current_code.get("activeTab", "index.html"),
-        "showPreview": state["showPreview"],
-        "currentEditor": {
-            "user_id": editor_id,
-            "username": editor_username,
-        } if editor_id else None,
-        "hostId": room.host_id,
-        "participants": participants,
-        "raisedHands": state["raisedHands"],
-        "cursors": state["cursors"],
-    })
-
-    # Рассылаем обновлённый список участников всем
-    await manager.broadcast(
-        room_id,
-        {"type": "participants", "list": participants},
-    )
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-
-            # ---------- code-update ----------
-            if msg_type == "code-update":
-                if state.get("currentEditorId") != user.id:
-                    continue
-
-                new_code: dict[str, Any] = {
-                    "files": data.get("files", {}),
-                    "activeTab": data.get("activeTab", "index.html"),
-                }
-                room.current_code = new_code
-                await debounce_saver.schedule_save(room_id, new_code)
-
-                await manager.broadcast(
-                    room_id,
-                    {
-                        "type": "code-update",
-                        "files": new_code["files"],
-                        "activeTab": new_code["activeTab"],
-                    },
-                    exclude=websocket,
-                )
-
-            # ---------- raise-hand ----------
-            elif msg_type == "raise-hand":
-                # Создателю комнаты рука не нужна: он возвращает права кнопкой
-                if room.host_id == user.id:
-                    continue
-
-                # ← НОВОЕ: сохраняем в state, чтобы новички видели
-                if not any(h["user_id"] == user.id for h in state["raisedHands"]):
-                    state["raisedHands"].append({
-                        "user_id": user.id,
-                        "username": user.username or "Участник",
-                    })
-
-                await manager.broadcast(
-                    room_id,
-                    {
-                        "type": "hand-raised",
-                        "user_id": user.id,
-                        "username": user.username or "Участник",
-                    },
-                )
-
-            # ---------- lower-hand ----------
-            elif msg_type == "lower-hand":
-                state["raisedHands"] = [
-                    h for h in state["raisedHands"] if h["user_id"] != user.id
-                ]
-
-                await manager.broadcast(
-                    room_id,
-                    {"type": "hand-lowered", "user_id": user.id},
-                )
-
-            # ---------- grant-edit ----------
-            elif msg_type == "grant-edit":
-                if room.host_id != user.id:
-                    continue
-
-                target_id = data.get("user_id")
-                room.current_editor_id = target_id
-                db.commit()
-                state["currentEditorId"] = target_id
-
-                # Убираем руку
-                state["raisedHands"] = [
-                    h for h in state["raisedHands"] if h["user_id"] != target_id
-                ]
-                await manager.broadcast(
-                    room_id,
-                    {"type": "hand-lowered", "user_id": target_id},
-                )
-
-                target_name = next(
-                    (
-                        p["username"]
-                        for p in manager.get_participants(room_id)
-                        if p["user_id"] == target_id
-                    ),
-                    "Участник",
-                )
-
-                await manager.broadcast(
-                    room_id,
-                    {
-                        "type": "editor-changed",
-                        "user_id": target_id,
-                        "username": target_name,
-                    },
-                )
-
-            # ---------- revoke-edit ----------
-            elif msg_type == "revoke-edit":
-                # ← ИЗМЕНЕНО: может отозвать и хост, и сам редактор
-                is_host = room.host_id == user.id
-                is_current_editor = state.get("currentEditorId") == user.id
-
-                if not (is_host or is_current_editor):
-                    continue
-
-                # ← НОВОЕ: очищаем курсор того, у кого забрали права
-                old_editor_id = state.get("currentEditorId")
-                if old_editor_id:
-                    state["cursors"].pop(str(old_editor_id), None)
-                    await manager.broadcast(
-                        room_id,
-                        {"type": "cursor-clear", "user_id": old_editor_id},
-                    )
-
-                room.current_editor_id = room.host_id
-                db.commit()
-                state["currentEditorId"] = room.host_id
-
-                host_name = next(
-                    (
-                        p["username"]
-                        for p in manager.get_participants(room_id)
-                        if p["user_id"] == room.host_id
-                    ),
-                    "Ведущий",
-                )
-
-                await manager.broadcast(
-                    room_id,
-                    {
-                        "type": "editor-changed",
-                        "user_id": room.host_id,
-                        "username": host_name,
-                    },
-                )
-
-            # ---------- preview-toggle ----------
-            # ← НОВОЕ
-            elif msg_type == "preview-toggle":
-                # Окном результата управляет только текущий редактор
-                if state.get("currentEditorId") != user.id:
-                    continue
-                show = bool(data.get("show", False))
-                state["showPreview"] = show
-                await manager.broadcast(
-                    room_id,
-                    {"type": "preview-toggle", "show": show},
-                    exclude=websocket,  # отправителю уже известно
-                )
-
-            # ---------- preview-refresh ----------
-            # ← НОВОЕ
-            elif msg_type == "preview-refresh":
-                await manager.broadcast(
-                    room_id,
-                    {"type": "preview-refresh"},
-                    exclude=websocket,
-                )
-
-            # ---------- cursor-update ----------
-            # ← НОВОЕ
-            elif msg_type == "cursor-update":
-                selection = data.get("selection")
-                color = data.get("color", "#61afef")
-
-                if selection:
-                    state["cursors"][str(user.id)] = {
-                        "username": user.username or "Участник",
-                        "selection": selection,
-                        "color": color,
-                    }
-
-                await manager.broadcast(
-                    room_id,
-                    {
-                        "type": "cursor-update",
-                        "user_id": user.id,
-                        "username": user.username or "Участник",
-                        "selection": selection,
-                        "color": color,
-                    },
-                    exclude=websocket,
-                )
-
-            # ---------- cursor-clear ----------
-            # ← НОВОЕ
-            elif msg_type == "cursor-clear":
-                state["cursors"].pop(str(user.id), None)
-                await manager.broadcast(
-                    room_id,
-                    {
-                        "type": "cursor-clear",
-                        "user_id": user.id,
-                    },
-                    exclude=websocket,
-                )
-
-            # ---------- request-state (оставляем для совместимости) ----------
-            elif msg_type == "request-state":
-                safe_code = (
-                    room.current_code if isinstance(room.current_code, dict) else {}
-                )
-                current_editor_id = state.get("currentEditorId")
-                await websocket.send_json({
-                    "type": "room-state",
-                    "files": safe_code.get("files", {}),
-                    "activeTab": safe_code.get("activeTab", "index.html"),
-                    "showPreview": state["showPreview"],
-                    "currentEditor": {
-                        "user_id": current_editor_id,
-                        "username": next(
-                            (
-                                p["username"]
-                                for p in manager.get_participants(room_id)
-                                if p["user_id"] == current_editor_id
-                            ),
-                            None,
-                        ),
-                    } if current_editor_id else None,
-                    "hostId": room.host_id,
-                    "participants": manager.get_participants(room_id),
-                    "raisedHands": state["raisedHands"],
-                    "cursors": state["cursors"],
-                })
-
-    except WebSocketDisconnect:
-        logger.info(f"Пользователь {user.id} отключился от комнаты {room_id}")
-    except RuntimeError:
-        logger.exception(f"Ошибка времени выполнения в WebSocket для комнаты {room_id}")
-    except Exception:
-        logger.exception(f"Непредвиденная ошибка в WebSocket для комнаты {room_id}")
-    finally:
-        left_user_id = manager.disconnect(room_id, websocket)
+    async def run(self) -> None:
+        if not await self._authenticate():
+            return
 
         try:
-            await debounce_saver.flush(room_id)
+            await self._join()
+            await self._message_loop()
+        except WebSocketDisconnect:
+            logger.info(
+                f"Пользователь {self.user_id} отключился от комнаты {self.room_id}"
+            )
+        except RuntimeError:
+            logger.exception(
+                f"Ошибка времени выполнения в WebSocket для комнаты {self.room_id}"
+            )
         except Exception:
             logger.exception(
-                f"Ошибка flush debounce-сэйвера при отключении из комнаты {room_id}"
+                f"Непредвиденная ошибка в WebSocket для комнаты {self.room_id}"
+            )
+        finally:
+            await self._cleanup()
+
+    # ---------- подключение ----------
+
+    async def _authenticate(self) -> bool:
+        token = self.websocket.query_params.get("token")
+
+        try:
+            self.user = get_websocket_user(token, self.db)
+        except HTTPException as e:
+            logger.warning(
+                f"Неудачная попытка подключения к WebSocket: {e.detail}"
+            )
+            await self.websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason="Unauthorized",
+            )
+            return False
+
+        self.room = self.db.query(Room).filter(Room.id == self.room_id).first()
+        if not self.room:
+            await self.websocket.close(code=4004, reason="Room not found")
+            return False
+
+        return True
+
+    async def _join(self) -> None:
+        room = self.current_room
+
+        await manager.connect(
+            self.room_id,
+            self.websocket,
+            self.user_id,
+            self.username,
+        )
+
+        state = manager._ensure_state(self.room_id)
+        # Сессия БД у каждого WebSocket своя и видит только своё состояние,
+        # поэтому текущего редактора держим в общем состоянии комнаты.
+        if state.get("currentEditorId") is None:
+            state["currentEditorId"] = room.current_editor_id
+        self.state = state
+
+        await self._send_room_state()
+
+        # Один и тот же снимок уходит и в room-state, и в broadcast.
+        participants_payload = manager.build_participants(self.room_id)
+        await manager.broadcast(self.room_id, participants_payload)
+
+    async def _message_loop(self) -> None:
+        while True:
+            data = await self.websocket.receive_json()
+            await self._dispatch(data)
+
+    async def _dispatch(self, data: dict[str, Any]) -> None:
+        match data.get("type"):
+            case "code-update":
+                await self._handle_code_update(data)
+            case "raise-hand":
+                await self._handle_raise_hand()
+            case "lower-hand":
+                await self._handle_lower_hand()
+            case "grant-edit":
+                await self._handle_grant_edit(data)
+            case "revoke-edit":
+                await self._handle_revoke_edit()
+            case "preview-toggle":
+                await self._handle_preview_toggle(data)
+            case "preview-refresh":
+                await self._handle_preview_refresh()
+            case "cursor-update":
+                await self._handle_cursor_update(data)
+            case "cursor-clear":
+                await self._handle_cursor_clear()
+            case "request-state":
+                await self._send_room_state()
+            case _:
+                logger.debug(
+                    "Неизвестный тип сообщения %r в комнате %s",
+                    data.get("type"),
+                    self.room_id,
+                )
+
+    # ---------- обработчики сообщений ----------
+
+    def _is_current_editor(self) -> bool:
+        return self.state.get("currentEditorId") == self.user_id
+
+    async def _handle_code_update(self, data: dict[str, Any]) -> None:
+        if not self._is_current_editor():
+            return
+
+        room = self.current_room
+        new_code: dict[str, Any] = {
+            "files": data.get("files", {}),
+            "activeTab": data.get("activeTab", "index.html"),
+        }
+        room.current_code = new_code
+        await debounce_saver.schedule_save(self.room_id, new_code)
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "code-update",
+                "files": new_code["files"],
+                "activeTab": new_code["activeTab"],
+            },
+            exclude=self.websocket,
+        )
+
+    async def _handle_raise_hand(self) -> None:
+        # Создателю комнаты рука не нужна: он возвращает права кнопкой.
+        if self.current_room.host_id == self.user_id:
+            return
+
+        if not any(h["user_id"] == self.user_id for h in self.state["raisedHands"]):
+            self.state["raisedHands"].append({
+                "user_id": self.user_id,
+                "username": self.username,
+            })
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "hand-raised",
+                "user_id": self.user_id,
+                "username": self.username,
+            },
+        )
+
+    async def _handle_lower_hand(self) -> None:
+        self.state["raisedHands"] = [
+            h for h in self.state["raisedHands"] if h["user_id"] != self.user_id
+        ]
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "hand-lowered", "user_id": self.user_id},
+        )
+
+    async def _handle_grant_edit(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        target_id = data.get("user_id")
+        self.current_room.current_editor_id = target_id
+        self.db.commit()
+        self.state["currentEditorId"] = target_id
+
+        self.state["raisedHands"] = [
+            h for h in self.state["raisedHands"] if h["user_id"] != target_id
+        ]
+        await manager.broadcast(
+            self.room_id,
+            {"type": "hand-lowered", "user_id": target_id},
+        )
+
+        target_name = next(
+            (
+                p["username"]
+                for p in manager.get_participants(self.room_id)
+                if p["user_id"] == target_id
+            ),
+            "Участник",
+        )
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "editor-changed",
+                "user_id": target_id,
+                "username": target_name,
+            },
+        )
+
+    async def _handle_revoke_edit(self) -> None:
+        room = self.current_room
+        is_host = room.host_id == self.user_id
+        is_current_editor = self._is_current_editor()
+
+        if not (is_host or is_current_editor):
+            return
+
+        old_editor_id = self.state.get("currentEditorId")
+        if old_editor_id:
+            self.state["cursors"].pop(str(old_editor_id), None)
+            await manager.broadcast(
+                self.room_id,
+                {"type": "cursor-clear", "user_id": old_editor_id},
             )
 
-        # ← НОВОЕ: сообщаем всем, что пользователь ушёл (для очистки курсора/руки)
+        room.current_editor_id = room.host_id
+        self.db.commit()
+        self.state["currentEditorId"] = room.host_id
+
+        host_name = next(
+            (
+                p["username"]
+                for p in manager.get_participants(self.room_id)
+                if p["user_id"] == room.host_id
+            ),
+            "Ведущий",
+        )
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "editor-changed",
+                "user_id": room.host_id,
+                "username": host_name,
+            },
+        )
+
+    async def _handle_preview_toggle(self, data: dict[str, Any]) -> None:
+        # Окном результата управляет только текущий редактор.
+        if not self._is_current_editor():
+            return
+
+        show = bool(data.get("show", False))
+        self.state["showPreview"] = show
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "preview-toggle", "show": show},
+            exclude=self.websocket,
+        )
+
+    async def _handle_preview_refresh(self) -> None:
+        await manager.broadcast(
+            self.room_id,
+            {"type": "preview-refresh"},
+            exclude=self.websocket,
+        )
+
+    async def _handle_cursor_update(self, data: dict[str, Any]) -> None:
+        selection = data.get("selection")
+        color = data.get("color", "#61afef")
+
+        if selection:
+            self.state["cursors"][str(self.user_id)] = {
+                "username": self.username,
+                "selection": selection,
+                "color": color,
+            }
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "cursor-update",
+                "user_id": self.user_id,
+                "username": self.username,
+                "selection": selection,
+                "color": color,
+            },
+            exclude=self.websocket,
+        )
+
+    async def _handle_cursor_clear(self) -> None:
+        self.state["cursors"].pop(str(self.user_id), None)
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "cursor-clear",
+                "user_id": self.user_id,
+            },
+            exclude=self.websocket,
+        )
+
+    async def _send_room_state(self) -> None:
+        room = self.current_room
+        safe_code = (
+            room.current_code if isinstance(room.current_code, dict) else {}
+        )
+        current_editor_id = self.state.get("currentEditorId")
+        participants = manager.get_participants(self.room_id)
+
+        await self.websocket.send_json({
+            "type": "room-state",
+            "files": safe_code.get("files", {}),
+            "activeTab": safe_code.get("activeTab", "index.html"),
+            "showPreview": self.state["showPreview"],
+            "currentEditor": {
+                "user_id": current_editor_id,
+                "username": next(
+                    (
+                        p["username"]
+                        for p in participants
+                        if p["user_id"] == current_editor_id
+                    ),
+                    None,
+                ),
+            } if current_editor_id else None,
+            "hostId": room.host_id,
+            "participants": participants,
+            "participantsVersion": self.state["participantsVersion"],
+            "raisedHands": self.state["raisedHands"],
+            "cursors": self.state["cursors"],
+        })
+
+    # ---------- завершение ----------
+
+    async def _cleanup(self) -> None:
+        left_user_id = manager.disconnect(self.room_id, self.websocket)
+
+        try:
+            await debounce_saver.flush(self.room_id)
+        except Exception:
+            logger.exception(
+                f"Ошибка flush debounce-сэйвера при отключении из комнаты {self.room_id}"
+            )
+
         if left_user_id is not None:
             await manager.broadcast(
-                room_id,
+                self.room_id,
                 {"type": "user-left", "user_id": left_user_id},
             )
 
-        await manager.broadcast(
-            room_id,
-            {"type": "participants", "list": manager.get_participants(room_id)},
-        )
+        if manager.rooms.get(self.room_id):
+            await manager.broadcast(
+                self.room_id,
+                manager.build_participants(self.room_id),
+            )
+
+
+@app.websocket("/ws/room/{room_id}")
+async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> None:
+    await RoomSession(websocket, room_id, db).run()

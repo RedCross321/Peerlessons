@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import api, { saveAuth } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
 import { getErrorMessages } from '@/utils/errors'
+import { setPageSeo } from '@/utils/seo'
 
 const router = useRouter()
 const username = ref('')
@@ -14,6 +15,14 @@ const fieldErrors = ref({})
 const errorMessages = ref([])
 const successMessage = ref('')
 const isLoading = ref(false)
+
+setPageSeo({
+  title: 'Регистрация — Peerlessons',
+  description:
+    'Создайте аккаунт Peerlessons, чтобы работать над кодом вместе в реальном времени.',
+  path: '/register',
+  robots: 'noindex, follow',
+})
 
 // Путь, на который нужно вернуться после регистрации и входа.
 const redirectTarget = computed(() => {
@@ -71,13 +80,6 @@ function validateForm() {
     errors.password = 'Введите пароль'
   } else if (password.value.length < 8) {
     errors.password = 'Минимум 8 символов'
-  } else if (
-    !/[A-Z]/.test(password.value) ||
-    !/[a-z]/.test(password.value) ||
-    !/\d/.test(password.value) ||
-    !/[!@#$%^&*(),.?":{}|<>_+=-]/.test(password.value)
-  ) {
-    errors.password = 'Нужны заглавная и строчная буквы, цифра и спецсимвол'
   }
 
   if (!password_check.value) {
@@ -200,6 +202,9 @@ const register_user = async () => {
             autocomplete="new-password"
             @input="clearPasswordErrors"
           />
+          <div v-if="!fieldErrors.password" class="field-hint">
+            Сложность оценивается по энтропии
+          </div>
           <div v-if="fieldErrors.password" class="field-error">
             {{ fieldErrors.password }}
           </div>
@@ -242,6 +247,8 @@ const register_user = async () => {
         <RouterLink :to="{ name: 'login-page', query: redirectTarget ? { redirect: redirectTarget } : {} }">
           Войти
         </RouterLink>
+        <span class="dot-sep">·</span>
+        <a href="/about/">О проекте</a>
       </p>
     </section>
   </main>

@@ -8,22 +8,24 @@ import HomePage from '@/views/HomePage.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
-  routes: [{
+  routes: [
+    {
       path: "/",
       name: "index",
-      component: HomePage
+      component: HomePage,
+      meta: { public: true }
     },
     {
       path: "/login",
       name: "login-page",
       component: LoginPage,
-      meta: { public: true }
+      meta: { public: true, guestOnly: true }
     },
     {
       path: "/register",
       name: "reg-page",
       component: RegisterPage,
-      meta: { public: true }
+      meta: { public: true, guestOnly: true }
     },
     {
       path: '/create-room',
@@ -54,7 +56,7 @@ router.beforeEach((to, from, next) => {
   }
 
   // Залогиненному пользователю незачем видеть страницы входа и регистрации.
-  if (to.meta.public && authenticated) {
+  if (to.meta.guestOnly && authenticated) {
     next({ name: 'index' })
     return
   }

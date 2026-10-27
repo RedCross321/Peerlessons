@@ -1,9 +1,19 @@
 <script setup>
 import { useRouter } from 'vue-router'
-import { getUser, logout } from '@/auth'
+import { getUser, isLoggedIn, logout } from '@/auth'
+import { setPageSeo } from '@/utils/seo'
 
 const router = useRouter()
+const authenticated = isLoggedIn()
 const username = getUser()?.username || 'участник'
+
+setPageSeo({
+  title: 'Peerlessons — совместное редактирование кода в реальном времени',
+  description:
+    'Peerlessons — self-hosted платформа для совместного редактирования кода: комнаты, Monaco Editor, передача прав и живой предпросмотр HTML/CSS/JS.',
+  path: '/',
+  robots: 'index, follow',
+})
 
 function handleLogout() {
   logout()
@@ -28,25 +38,44 @@ function handleLogout() {
         прямо сейчас
       </h1>
 
-      <p class="home-lead">
+      <p v-if="authenticated" class="home-lead">
         Создайте комнату и делитесь редактором в реальном времени — без установки
         и лишних настроек.
       </p>
+      <p v-else class="home-lead">
+        Создайте аккаунт, чтобы открыть комнату, пригласить участников и писать
+        код вместе в реальном времени.
+      </p>
 
       <div class="home-actions">
-        <RouterLink to="/create-room" class="btn btn-primary btn-lg">
-          Создать комнату
-        </RouterLink>
-        <button
-          type="button"
-          class="btn btn-ghost btn-lg btn-logout"
-          @click="handleLogout"
-        >
-          Выйти из аккаунта
-        </button>
+        <template v-if="authenticated">
+          <RouterLink to="/create-room" class="btn btn-primary btn-lg">
+            Создать комнату
+          </RouterLink>
+          <button
+            type="button"
+            class="btn btn-ghost btn-lg btn-logout"
+            @click="handleLogout"
+          >
+            Выйти из аккаунта
+          </button>
+        </template>
+        <template v-else>
+          <RouterLink to="/register" class="btn btn-primary btn-lg">
+            Создать аккаунт
+          </RouterLink>
+          <RouterLink to="/login" class="btn btn-ghost btn-lg">
+            Войти
+          </RouterLink>
+        </template>
       </div>
 
-      <p class="home-note">Вы вошли как <b>{{ username }}</b></p>
+      <p v-if="authenticated" class="home-note">
+        Вы вошли как <b>{{ username }}</b>
+      </p>
+      <p v-else class="home-note">
+        <a href="/about/">Подробнее о проекте</a>
+      </p>
     </div>
   </main>
 </template>

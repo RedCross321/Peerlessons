@@ -4,12 +4,22 @@ import { useRouter } from 'vue-router'
 import api from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
 import { getErrorMessages } from '@/utils/errors'
+import { setPageSeo } from '@/utils/seo'
 
 const router = useRouter()
 const title = ref('')
 const titleError = ref('')
 const isLoading = ref(false)
 const errorMessages = ref([])
+
+setPageSeo({
+  title: 'Новая комната — Peerlessons',
+  description:
+    'Создание комнаты для совместного редактирования кода в Peerlessons.',
+  path: '/create-room',
+  robots: 'noindex, nofollow',
+  canonical: false,
+})
 
 function clearTitleError() {
   titleError.value = ''

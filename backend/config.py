@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     secret_key: str = ""
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
+    password_strength_threshold: float = 0.4
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

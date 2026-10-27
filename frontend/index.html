@@ -2,16 +2,78 @@
 <html lang="ru">
   <head>
     <meta charset="UTF-8">
-    <link rel="icon" href="/favicon.ico">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/favicon.ico" sizes="any">
     <meta name="theme-color" content="#090b10">
+
+    <title>Peerlessons — совместное редактирование кода в реальном времени</title>
+    <meta
+      name="description"
+      content="Peerlessons — self-hosted платформа для совместного редактирования кода: комнаты, Monaco Editor, передача прав и живой предпросмотр HTML/CSS/JS. Vue 3, FastAPI, WebSocket, PostgreSQL."
+    >
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="%SITE_URL%/">
+
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Peerlessons">
+    <meta property="og:locale" content="ru_RU">
+    <meta property="og:title" content="Peerlessons — совместное редактирование кода в реальном времени">
+    <meta
+      property="og:description"
+      content="Комнаты, Monaco Editor, передача прав редактирования и живой предпросмотр HTML/CSS/JS."
+    >
+    <meta property="og:url" content="%SITE_URL%/">
+    <meta property="og:image" content="%SITE_URL%/og-cover.png">
+    <meta property="og:image:type" content="image/png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="Peerlessons — совместное редактирование кода">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Peerlessons — совместное редактирование кода в реальном времени">
+    <meta
+      name="twitter:description"
+      content="Комнаты, Monaco Editor, передача прав редактирования и живой предпросмотр HTML/CSS/JS."
+    >
+    <meta name="twitter:image" content="%SITE_URL%/og-cover.png">
+    <meta name="twitter:image:alt" content="Peerlessons — совместное редактирование кода">
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
       rel="stylesheet"
     >
-    <title>Peerlessons — совместное кодирование</title>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Peerlessons",
+        "description": "Self-hosted платформа для совместного редактирования кода в реальном времени: комнаты, Monaco Editor, передача прав и живой предпросмотр HTML/CSS/JS.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Web",
+        "browserRequirements": "Requires JavaScript. Requires HTML5.",
+        "featureList": [
+          "Совместное редактирование кода в реальном времени",
+          "Monaco Editor с подсветкой и автодополнением",
+          "Передача прав редактирования",
+          "Живой предпросмотр HTML/CSS/JS",
+          "Комнаты по ссылке"
+        ],
+        "screenshot": "%SITE_URL%/og-cover.png",
+        "url": "%SITE_URL%/",
+        "inLanguage": "ru",
+        "isAccessibleForFree": true,
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "RUB"
+        },
+        "license": "https://www.gnu.org/licenses/gpl-3.0.html"
+      }
+    </script>
+
     <style>
       html,
       body {
@@ -22,6 +84,29 @@
   </head>
   <body>
     <div id="app"></div>
+
+    <noscript>
+      <main
+        style="min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; box-sizing: border-box; background: #090b10; color: #f3f5f9; font-family: Manrope, sans-serif; text-align: center;"
+      >
+        <h1 style="margin: 0 0 18px; font-size: 42px; letter-spacing: -0.03em;">
+          Peerlessons
+        </h1>
+        <p style="max-width: 680px; margin: 0 0 24px; color: #9aa4b6; font-size: 18px; line-height: 1.6;">
+          Self-hosted платформа для совместного редактирования кода в реальном
+          времени: комнаты, Monaco Editor, передача прав редактирования и живой
+          предпросмотр HTML/CSS/JS.
+        </p>
+        <p style="margin: 0; font-size: 16px;">
+          <a href="/login" style="color: #ff7a45; text-decoration: none;">Войти</a>
+          <span style="color: #6d7789;"> · </span>
+          <a href="/register" style="color: #ff7a45; text-decoration: none;">Создать аккаунт</a>
+          <span style="color: #6d7789;"> · </span>
+          <a href="/about/" style="color: #ff7a45; text-decoration: none;">О проекте</a>
+        </p>
+      </main>
+    </noscript>
+
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

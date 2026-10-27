@@ -2,25 +2,30 @@ import re
 from datetime import datetime
 from uuid import UUID
 
+from config import settings
+from password_strength import PasswordPolicy
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+PASSWORD_POLICY = PasswordPolicy.from_names(
+    length=8,
+    strength=settings.password_strength_threshold,
+)
 
 
 def check_password_strength(password: str) -> None:
-    errors = []
+    """
+    Оценивает сложность пароля по энтропии (password-strength).
+    Коэффициент strength нормирован в диапазоне 0..1; порог задаётся
+    в настройках и по умолчанию равен 0.4.
+    """
+    if not password:
+        raise ValueError("Пароль не может быть пустым")
 
-    if len(password) < 8:
-        errors.append("минимум 8 символов")
-    if not re.search(r"[A-Z]", password):
-        errors.append("хотя бы одна заглавная буква")
-    if not re.search(r"[a-z]", password):
-        errors.append("хотя бы одна строчная буква")
-    if not re.search(r"\d", password):
-        errors.append("хотя бы одна цифра")
-    if not re.search(r'[!@#$%^&*(),.?":{}|<>_+=-]', password):
-        errors.append("хотя бы один спецсимвол")
-
-    if errors:
-        raise ValueError("Пароль слишком простой. Требования: " + "; ".join(errors))
+    if PASSWORD_POLICY.test(password):
+        raise ValueError(
+            "Пароль слишком слабый. Используйте более длинный пароль "
+            "или добавьте разнообразия."
+        )
 
 
 class UserCreate(BaseModel):

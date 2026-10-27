@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#090b10"/>
+  <rect x="1" y="1" width="1198" height="628" fill="none" stroke="#222a39" stroke-width="2"/>
+
+  <rect x="80" y="76" width="72" height="72" rx="18" fill="#ff7a45"/>
+  <text x="116" y="128" font-family="DejaVu Sans Mono, monospace" font-size="44" font-weight="700" fill="#15100d" text-anchor="middle">/</text>
+  <text x="176" y="130" font-family="DejaVu Sans, sans-serif" font-size="54" font-weight="700" fill="#f3f5f9">Peerlessons</text>
+
+  <rect x="80" y="206" width="64" height="4" rx="2" fill="#ff7a45"/>
+
+  <text x="80" y="304" font-family="DejaVu Sans, sans-serif" font-size="58" font-weight="700" fill="#f3f5f9">Совместное редактирование</text>
+  <text x="80" y="382" font-family="DejaVu Sans, sans-serif" font-size="58" font-weight="700" fill="#ff7a45">кода в реальном времени</text>
+
+  <text x="80" y="460" font-family="DejaVu Sans, sans-serif" font-size="26" fill="#9aa4b6">Monaco Editor · передача прав · живой предпросмотр HTML/CSS/JS</text>
+
+  <rect x="80" y="512" width="250" height="54" rx="12" fill="#121620" stroke="#222a39"/>
+  <circle cx="110" cy="539" r="6" fill="#e8734a"/>
+  <text x="132" y="547" font-family="DejaVu Sans Mono, monospace" font-size="24" fill="#f3f5f9">index.html</text>
+
+  <rect x="350" y="512" width="240" height="54" rx="12" fill="#121620" stroke="#222a39"/>
+  <circle cx="380" cy="539" r="6" fill="#5b8def"/>
+  <text x="402" y="547" font-family="DejaVu Sans Mono, monospace" font-size="24" fill="#f3f5f9">style.css</text>
+
+  <rect x="610" y="512" width="220" height="54" rx="12" fill="#121620" stroke="#222a39"/>
+  <circle cx="640" cy="539" r="6" fill="#e5c07b"/>
+  <text x="662" y="547" font-family="DejaVu Sans Mono, monospace" font-size="24" fill="#f3f5f9">main.js</text>
+
+  <text x="1120" y="582" font-family="DejaVu Sans, sans-serif" font-size="20" fill="#6d7789" text-anchor="end">self-hosted · GPL-3.0</text>
+</svg>

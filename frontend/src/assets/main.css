@@ -358,6 +358,11 @@ a:hover {
   transition: background-color 9999s ease-out;
 }
 
+.field-hint {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 .field-error {
   margin-top: 0;
   color: #ff9d8b;
@@ -416,6 +421,11 @@ a:hover {
 
 .auth-footer a {
   font-weight: 600;
+}
+
+.dot-sep {
+  margin: 0 4px;
+  color: var(--text-dim);
 }
 
 .cancel-link {

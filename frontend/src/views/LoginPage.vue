@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import api, { saveAuth } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
 import { getErrorMessages } from '@/utils/errors'
+import { setPageSeo } from '@/utils/seo'
 
 const router = useRouter()
 const email = ref('')
@@ -11,6 +12,14 @@ const password = ref('')
 const fieldErrors = ref({})
 const errorMessages = ref([])
 const isLoading = ref(false)
+
+setPageSeo({
+  title: 'Peerlessons — совместное редактирование кода в реальном времени',
+  description:
+    'Peerlessons — self-hosted платформа для совместного редактирования кода: комнаты, Monaco Editor, передача прав и живой предпросмотр HTML/CSS/JS.',
+  path: '/login',
+  robots: 'noindex, follow',
+})
 
 // Путь, на который нужно вернуться после входа (защищаемся от внешних редиректов).
 const redirectTarget = computed(() => {
@@ -146,6 +155,8 @@ const login = async () => {
         <RouterLink :to="{ name: 'reg-page', query: redirectTarget ? { redirect: redirectTarget } : {} }">
           Создать аккаунт
         </RouterLink>
+        <span class="dot-sep">·</span>
+        <a href="/about/">О проекте</a>
       </p>
     </section>
   </main>
