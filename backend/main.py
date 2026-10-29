@@ -1,12 +1,14 @@
 import asyncio
 import logging
+import re
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from captcha import get_client_ip, verify_turnstile
 from config import settings
-from database import Base, engine, get_db
+from database import Base, SessionLocal, engine, get_db
 from email_change import (
     create_email_change,
     delete_email_change_rows,
@@ -77,7 +79,7 @@ from security import (
     verify_password,
     verify_refresh_token,
 )
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from totp import (
@@ -101,6 +103,60 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# Миграции, которые create_all() не делает: он создаёт только недостающие
+# таблицы и не трогает существующие.
+_SCHEMA_STATEMENTS = (
+    # Псевдоним комнаты для ссылок вида /room/<alias>.
+    "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS alias VARCHAR(64)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_rooms_alias ON rooms (alias)",
+    # Шифротекст TOTP-секрета (AES-GCM ~83 символа) не влезает в прежние 64.
+    "ALTER TABLE user_totp ALTER COLUMN secret TYPE VARCHAR(255)",
+)
+
+
+def _backfill_room_aliases() -> None:
+    """Проставляет псевдонимы комнатам, созданным до появления колонки."""
+    with SessionLocal() as db:
+        rooms = db.query(Room).filter(Room.alias.is_(None)).all()
+        if not rooms:
+            return
+
+        for room in rooms:
+            room.alias = build_room_alias(db, room.title)
+            # autoflush выключен — без flush следующий поиск не увидит
+            # только что занятый псевдоним.
+            db.flush()
+
+        db.commit()
+        logger.info("Проставлены псевдонимы для %s комнат", len(rooms))
+
+
+def ensure_schema_compatibility() -> None:
+    """Идемпотентно доводит схему БД до версии, ожидаемой кодом.
+
+    В проекте нет Alembic, а create_all() не меняет существующие таблицы,
+    поэтому добавленные позже колонки и расширенные типы доводим здесь.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+
+    try:
+        with engine.begin() as conn:
+            for statement in _SCHEMA_STATEMENTS:
+                conn.execute(text(statement))
+    except SQLAlchemyError:
+        logger.exception(
+            "Не удалось обновить схему БД. Выполните вручную:\n%s",
+            ";\n".join(_SCHEMA_STATEMENTS),
+        )
+        return
+
+    try:
+        _backfill_room_aliases()
+    except SQLAlchemyError:
+        logger.exception("Не удалось проставить псевдонимы старым комнатам")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.email_verification_enabled and not settings.smtp_host:
@@ -118,6 +174,7 @@ async def lifespan(app: FastAPI):
         )
 
     Base.metadata.create_all(bind=engine)
+    ensure_schema_compatibility()
     yield
 
 
@@ -177,8 +234,6 @@ class DebouncedSaver:
                 if pending is None:
                     return
 
-                from database import SessionLocal
-
                 db = SessionLocal()
                 try:
                     room = db.query(Room).filter(Room.id == room_id).first()
@@ -217,8 +272,6 @@ class DebouncedSaver:
 
         pending = self._pending_data.pop(room_id, None)
         if pending:
-            from database import SessionLocal
-
             db = SessionLocal()
             try:
                 room = db.query(Room).filter(Room.id == room_id).first()
@@ -1055,6 +1108,87 @@ def disable_totp(
     return {"totp_enabled": False}
 
 
+# ---------- псевдонимы комнат ----------
+
+_ROOM_ALIAS_MAX = 40
+
+# Слова, которые нельзя занимать: конфликтуют с маршрутами фронтенда.
+_RESERVED_ROOM_ALIASES = frozenset(
+    {
+        "api",
+        "ws",
+        "room",
+        "rooms",
+        "admin",
+        "health",
+        "login",
+        "logout",
+        "register",
+        "account",
+        "create-room",
+        "verify-email",
+        "about",
+        "new",
+    }
+)
+
+_TRANSLIT_RU = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
+    "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y",
+    "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def slugify_room_alias(value: str) -> str:
+    """Приводит псевдоним к виду, пригодному для URL."""
+    text = "".join(
+        _TRANSLIT_RU.get(char, char)
+        for char in (value or "").strip().lower()
+    )
+    # Ünïcode -> unicode: снимаем диакритику у латиницы.
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")[:_ROOM_ALIAS_MAX].strip("-")
+
+
+def _alias_available(db: Session, alias: str) -> bool:
+    """Свободен ли псевдоним: не занят и не совпадает с маршрутом сайта."""
+    if alias in _RESERVED_ROOM_ALIASES:
+        return False
+    return db.query(Room.id).filter(Room.alias == alias).first() is None
+
+
+def build_room_alias(db: Session, title: str) -> str:
+    """Строит псевдоним комнаты из её названия.
+
+    Название — для людей (может повторяться, быть на кириллице), а псевдоним
+    — это часть ссылки /room/<alias>, поэтому он должен быть уникальным:
+    при совпадении названий добавляем числовой суффикс.
+    """
+    base = slugify_room_alias(title) or "room"
+
+    if _alias_available(db, base):
+        return base
+
+    trimmed = base[: _ROOM_ALIAS_MAX - 3].strip("-") or "room"
+    for number in range(2, 10):
+        candidate = f"{trimmed}-{number}"
+        if _alias_available(db, candidate):
+            return candidate
+
+    trimmed = base[: _ROOM_ALIAS_MAX - 5].strip("-") or "room"
+    for _ in range(6):
+        candidate = f"{trimmed}-{uuid4().hex[:4]}"
+        if _alias_available(db, candidate):
+            return candidate
+
+    return f"room-{uuid4().hex[:8]}"
+
+
 @app.post("/api/room", response_model=RoomRead, tags=["Room"])
 def create_room(
     room_in: RoomCreate,
@@ -1070,17 +1204,59 @@ def create_room(
         "activeTab": "index.html",
     }
 
-    room = Room(
-        title=room_in.title,
-        host_id=current_user.id,
-        status="waiting",
-        current_code=default_code,
-        language="html",
-        current_editor_id=current_user.id,
-    )
-    db.add(room)
-    db.commit()
+    # Псевдоним строится из названия. Гонка на уникальности (другой запрос
+    # занял тот же слаг между проверкой и вставкой) — повод просто подобрать
+    # следующий вариант, а не ошибка для пользователя.
+    for _ in range(3):
+        room = Room(
+            title=room_in.title,
+            alias=build_room_alias(db, room_in.title),
+            host_id=current_user.id,
+            status="waiting",
+            current_code=default_code,
+            language="html",
+            current_editor_id=current_user.id,
+        )
+        db.add(room)
+        try:
+            db.commit()
+            break
+        except IntegrityError:
+            db.rollback()
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Не удалось создать комнату, попробуйте ещё раз",
+        )
+
     db.refresh(room)
+    return room
+
+
+@app.get(
+    "/api/rooms/by-alias/{alias}",
+    response_model=RoomRead,
+    tags=["Room"],
+)
+def get_room_by_alias(
+    alias: str,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> Room:
+    """Находит комнату по псевдониму — для подключения с главной страницы.
+
+    Авторизация обязательна, иначе псевдонимы можно перебирать анонимно.
+    """
+    room = (
+        db.query(Room)
+        .filter(Room.alias == slugify_room_alias(alias))
+        .first()
+    )
+    if room is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Комната с таким псевдонимом не найдена",
+        )
     return room
 
 
@@ -1181,19 +1357,17 @@ class RoomSession:
             )
             return await self._reject(4401, "Unauthorized")
 
-        try:
-            room_uuid = UUID(self.room_id)
-        except ValueError:
-            logger.warning(f"WebSocket: некорректный room_id {self.room_id!r}")
-            return await self._reject(4404, "Room not found")
-
-        self.room = self.db.query(Room).filter(Room.id == room_uuid).first()
+        self.room = self._lookup_room()
         if not self.room:
             logger.warning(
                 f"WebSocket: комната {self.room_id} не найдена "
                 f"(user_id={self.user.id})"
             )
             return await self._reject(4404, "Room not found")
+
+        # В менеджере комнаты ключуются строкой: приводим ключ к UUID,
+        # иначе подключение по псевдониму создаст "вторую" комнату в памяти.
+        self.room_id = str(self.room.id)
 
         # Браузер не умеет ставить произвольные заголовки, поэтому токен
         # приходит в Sec-WebSocket-Protocol. Если клиент предложил протокол,
@@ -1202,6 +1376,18 @@ class RoomSession:
         subprotocol = offered.split(",")[0].strip() or None
         await self.websocket.accept(subprotocol=subprotocol)
         return True
+
+    def _lookup_room(self) -> Room | None:
+        """Ищет комнату по UUID или по псевдониму."""
+        try:
+            room_uuid = UUID(self.room_id)
+        except ValueError:
+            return (
+                self.db.query(Room)
+                .filter(Room.alias == slugify_room_alias(self.room_id))
+                .first()
+            )
+        return self.db.query(Room).filter(Room.id == room_uuid).first()
 
     async def _reject(self, code: int, reason: str) -> bool:
         """Отказ клиенту.
@@ -1476,6 +1662,8 @@ class RoomSession:
         await self.websocket.send_json(
             {
                 "type": "room-state",
+                "title": room.title,
+                "alias": room.alias,
                 "files": safe_code.get("files", {}),
                 "activeTab": safe_code.get("activeTab", "index.html"),
                 "showPreview": self.state["showPreview"],

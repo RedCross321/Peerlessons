@@ -269,6 +269,22 @@ server {
         try_files $uri /index.html;
     }
 
+    # ----- Превью пользовательского кода -----
+    # Отдельный документ со своей, намеренно мягкой политикой: внутри него
+    # выполняется код из комнаты (внешние картинки, запросы к чужим API).
+    # Безопасность держится на sandbox без allow-same-origin у iframe, поэтому
+    # этот документ не имеет доступа к приложению.
+    # ВАЖНО: add_header здесь перекрывает унаследованные, в том числе
+    # X-Frame-Options: DENY — иначе оболочку нельзя было бы встроить в превью.
+    location = /preview.html {
+        add_header Content-Security-Policy "default-src * data: blob: https: http: ws: wss: 'unsafe-inline' 'unsafe-eval'; frame-ancestors 'self'" always;
+        add_header Cache-Control "no-cache" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+
+        try_files $uri =404;
+    }
+
     location = /index.html {
         add_header Cache-Control "no-cache" always;
         include /etc/nginx/snippets/peerlessons-security-headers.conf;

@@ -205,6 +205,7 @@ class RoomCreate(BaseModel):
 class RoomRead(BaseModel):
     id: UUID
     title: str
+    alias: str | None = None
     host_id: int
     status: str
     created_at: datetime

@@ -44,6 +44,10 @@ class Room(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Псевдоним для подключения по имени: /room/<alias>
+    alias: Mapped[str | None] = mapped_column(
+        String(64), unique=True, index=True, nullable=True
+    )
     host_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     current_editor_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id"), nullable=True
