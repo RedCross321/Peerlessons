@@ -53,7 +53,8 @@ async function create() {
   try {
     const { data } = await api.post('/room', { title: title.value.trim() })
 
-    router.push(`/room/${data.id}`)
+    // Псевдоним строит сервер из названия — по нему комната и открывается.
+    router.push(`/room/${data.alias || data.id}`)
   } catch (err) {
     console.error('Ошибка создания комнаты:', err)
     errorMessages.value = getErrorMessages(err, 'Не удалось создать комнату')

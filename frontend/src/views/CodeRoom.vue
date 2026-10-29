@@ -4,24 +4,41 @@ import { useRoute, useRouter } from 'vue-router'
 import '@/monaco-workers'
 import * as monaco from 'monaco-editor'
 import { emmetHTML, emmetCSS, emmetJSX } from 'emmet-monaco-es'
-import { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
+import api, { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
+import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
 
 const route = useRoute()
 const router = useRouter()
-const roomId = route.params.id
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// В адресе может быть и UUID, и псевдоним комнаты.
+const roomKey = String(route.params.id || '')
+const roomId = ref(UUID_PATTERN.test(roomKey) ? roomKey : '')
+const roomTitle = ref('')
+const roomAlias = ref(UUID_PATTERN.test(roomKey) ? '' : roomKey)
+const inviteCopied = ref(false)
+let inviteTimer = null
+
 const user = getUser()
 const myUserId = ref(user?.id)
 const myUsername = ref(user?.username || 'Гость')
 const isHost = ref(false)
 const hostId = ref(null)
-const shortRoomId = computed(() => String(roomId || '').slice(0, 8))
+const shortRoomId = computed(() => String(roomKey || '').slice(0, 8))
+
+const roomLink = computed(() => {
+  const key = roomAlias.value || roomId.value || roomKey
+  return `${window.location.origin}/room/${key}`
+})
 
 setPageSeo({
   title: 'Комната — Peerlessons',
   description:
     'Приватная комната совместного редактирования кода в Peerlessons.',
-  path: `/room/${roomId}`,
+  path: `/room/${roomKey}`,
   robots: 'noindex, nofollow',
   canonical: false,
 })
@@ -69,6 +86,8 @@ const hasRaisedHand = computed(() =>
 const showPreview = ref(false)
 const previewKey = ref(0)
 const previewHtml = ref('')
+const previewFrame = ref(null)
+const previewShellUrl = `${import.meta.env.BASE_URL}preview.html`
 const PREVIEW_DEBOUNCE_MS = 600
 const previewWidth = ref(400)
 const isResizing = ref(false)
@@ -215,6 +234,34 @@ function schedulePreviewUpdate() {
   previewTimer = setTimeout(() => updatePreviewNow(), PREVIEW_DEBOUNCE_MS)
 }
 
+// Превью — отдельный документ (/preview.html) со своей, более мягкой CSP:
+// иначе внешние картинки и запросы к чужим API блокировались бы политикой сайта
+// (srcdoc-документ наследует её и ослабить не может).
+function postPreviewHtml() {
+  const frame = previewFrame.value
+  if (!frame?.contentWindow) return
+
+  // targetOrigin '*' неизбежен: iframe в sandbox без allow-same-origin имеет
+  // непрозрачный origin, и сообщение с origin сайта до него не дойдёт.
+  frame.contentWindow.postMessage(
+    { type: 'preview-html', html: previewHtml.value },
+    '*'
+  )
+}
+
+function onPreviewMessage(event) {
+  const frame = previewFrame.value
+  if (!frame || event.source !== frame.contentWindow) return
+
+  const data = event.data
+  if (data && data.type === 'preview-ready') {
+    postPreviewHtml()
+  }
+}
+
+// Оболочка могла ещё не успеть подписаться — досылаем код по её сигналу.
+watch(previewHtml, postPreviewHtml)
+
 // ===== Инициализация =====
 onMounted(async () => {
   if (!isLoggedIn()) {
@@ -222,8 +269,27 @@ onMounted(async () => {
     return
   }
 
+  // В адресе может быть псевдоним — сначала узнаём UUID комнаты.
+  if (!roomId.value) {
+    try {
+      const { data } = await api.get(
+        `/rooms/by-alias/${encodeURIComponent(roomKey)}`
+      )
+
+      roomId.value = data.id
+      roomTitle.value = data.title || ''
+      roomAlias.value = data.alias || roomKey
+    } catch (err) {
+      shouldReconnect = false
+      connectionStatus.value = 'error'
+      connectError.value = getErrorMessages(err, 'Комната не найдена')[0]
+      return
+    }
+  }
+
   await nextTick()
   window.addEventListener('resize', handleWindowResize)
+  window.addEventListener('message', onPreviewMessage)
 
   try {
       emmetHTML(monaco, ['html'])
@@ -383,6 +449,8 @@ onUnmounted(() => {
 
   stopResize()
   window.removeEventListener('resize', handleWindowResize)
+  window.removeEventListener('message', onPreviewMessage)
+  clearTimeout(inviteTimer)
 
   // ← НОВОЕ: очищаем свой курсор при уходе
   send({ type: 'cursor-clear' })
@@ -513,7 +581,7 @@ async function connectWS() {
 
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
   const token = localStorage.getItem('token')
-  const url = `${protocol}://${location.host}/ws/room/${roomId}`
+  const url = `${protocol}://${location.host}/ws/room/${roomId.value}`
 
   // Токен передаём через Sec-WebSocket-Protocol, а не в query,
   // чтобы он не попадал в access-логи nginx.
@@ -537,6 +605,9 @@ async function connectWS() {
       ignoreChanges = true
 
       try {
+        if (data.title) roomTitle.value = data.title
+        if (data.alias) roomAlias.value = data.alias
+
         files.value = data.files || files.value
         activeTab.value = data.activeTab || activeTab.value
         showPreview.value = !!data.showPreview
@@ -731,6 +802,49 @@ function describeClose(event) {
   if (event.code === 4403) return 'Подключение с этого адреса запрещено сервером.'
   if (event.code === 4404) return 'Комната не найдена или удалена.'
   return event.reason || 'Не удалось подключиться к комнате.'
+}
+
+// ===== Приглашение =====
+
+async function copyInvite() {
+  const title = roomTitle.value.trim()
+  const text = title
+    ? `Присоединяйтесь к комнате «${title}» на Peerlessons: ${roomLink.value}`
+    : `Присоединяйтесь к комнате на Peerlessons: ${roomLink.value}`
+
+  if (await writeToClipboard(text)) {
+    inviteCopied.value = true
+    clearTimeout(inviteTimer)
+    inviteTimer = setTimeout(() => {
+      inviteCopied.value = false
+    }, 2000)
+  }
+}
+
+async function writeToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // Ниже — запасной вариант для браузеров без Clipboard API.
+    }
+  }
+
+  try {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.setAttribute('readonly', '')
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    const copied = document.execCommand('copy')
+    document.body.removeChild(area)
+    return copied
+  } catch {
+    return false
+  }
 }
 
 function scheduleReconnect() {
@@ -978,18 +1092,29 @@ function revokeEdit() {
         </RouterLink>
         <span class="room-sep"></span>
         <div class="room-meta">
-          <span class="room-title">Комната</span>
-          <span class="room-id">{{ shortRoomId }}</span>
+          <span class="room-title">{{ roomTitle || 'Комната' }}</span>
+          <span class="room-id">{{ roomAlias || shortRoomId }}</span>
         </div>
       </div>
 
-      <div class="room-status">
-        <span class="status-dot" :class="{ edit: canEdit }"></span>
-        <span v-if="currentEditorName" class="status-text">
-          Редактирует <b>{{ currentEditorName }}</b>
-        </span>
-        <span v-else class="status-text">Режим просмотра</span>
-        <span v-if="canEdit" class="badge badge-accent">Вы редактируете</span>
+      <div class="room-header-right">
+        <div class="room-status">
+          <span class="status-dot" :class="{ edit: canEdit }"></span>
+          <span v-if="currentEditorName" class="status-text">
+            Редактирует <b>{{ currentEditorName }}</b>
+          </span>
+          <span v-else class="status-text">Режим просмотра</span>
+          <span v-if="canEdit" class="badge badge-accent">Вы редактируете</span>
+        </div>
+
+        <button
+          v-if="isHost"
+          type="button"
+          class="btn btn-secondary btn-sm invite-btn"
+          @click="copyInvite"
+        >
+          {{ inviteCopied ? 'Скопировано' : 'Пригласить' }}
+        </button>
       </div>
     </header>
 
@@ -1036,12 +1161,14 @@ function revokeEdit() {
             <!-- allow-same-origin намеренно не включён: пользовательский код
                  не должен получать доступ к localStorage и DOM родителя. -->
             <iframe
+              ref="previewFrame"
               :key="previewKey"
-              :srcdoc="previewHtml"
+              :src="previewShellUrl"
               sandbox="allow-scripts allow-modals allow-forms"
               referrerpolicy="no-referrer"
               class="preview-frame"
               title="Code Preview"
+              @load="postPreviewHtml"
             ></iframe>
           </div>
         </div>
@@ -1176,12 +1303,32 @@ function revokeEdit() {
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 600;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .room-id {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 12px;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-header-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.invite-btn {
+  flex: none;
+  white-space: nowrap;
 }
 
 .room-status {

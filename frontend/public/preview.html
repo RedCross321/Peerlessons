@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Peerlessons — превью</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #fff;
+      }
+
+      #stage {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Оболочка превью. Загружается как самостоятельный документ (а не srcdoc),
+      поэтому у неё своя CSP — в ней разрешены внешние запросы, которые нужны
+      пользовательскому коду: картинки с чужих домов, fetch к сторонним API.
+
+      Код комнаты приходит через postMessage и рендерится во вложенный iframe
+      через srcdoc: он наследует политику этой оболочки, то есть мягкую.
+    -->
+    <iframe id="stage" title="Результат"></iframe>
+
+    <script>
+      const stage = document.getElementById('stage')
+
+      window.addEventListener('message', (event) => {
+        // Принимаем код только от родительской страницы.
+        if (event.source !== window.parent) return
+
+        const data = event.data
+        if (!data || data.type !== 'preview-html') return
+        if (typeof data.html !== 'string') return
+
+        stage.srcdoc = data.html
+      })
+
+      // Родитель ждёт этот сигнал: до него сообщения могут потеряться.
+      window.parent.postMessage({ type: 'preview-ready' }, '*')
+    </script>
+  </body>
+</html>
