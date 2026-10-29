@@ -12,6 +12,8 @@ function buildSeoFiles(siteUrl, repoUrl) {
   const disallow = [
     'Disallow: /room/',
     'Disallow: /create-room',
+    'Disallow: /account',
+    'Disallow: /verify-email',
     'Disallow: /api/',
     'Disallow: /ws/',
   ]

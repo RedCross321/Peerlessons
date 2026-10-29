@@ -33,6 +33,10 @@ function decodeJwtPayload(token) {
   }
 }
 
+export function saveUser(user) {
+  localStorage.setItem(USER_KEY, JSON.stringify(user))
+}
+
 export function saveAuth(accessToken, refreshToken, user) {
   localStorage.setItem(ACCESS_TOKEN_KEY, accessToken)
   if (refreshToken) {

@@ -57,7 +57,8 @@ const currentEditorName = ref(null)
 const currentEditorId = ref(null)
 const participants = ref([])
 const participantsVersion = ref(-1)
-const connectionStatus = ref('connecting') // connecting | reconnecting | online
+const connectionStatus = ref('connecting') // connecting | reconnecting | online | error
+const connectError = ref('')
 const raisedHands = ref([])
 
 const hasRaisedHand = computed(() =>
@@ -71,6 +72,12 @@ const previewHtml = ref('')
 const PREVIEW_DEBOUNCE_MS = 600
 const previewWidth = ref(400)
 const isResizing = ref(false)
+const editorArea = ref(null)
+const MIN_PREVIEW_WIDTH = 250
+const MIN_EDITOR_WIDTH = 320
+let resizeStartX = 0
+let resizeStartWidth = 0
+let layoutFrame = null
 
 // Удалённые курсоры
 const remoteSelections = ref({})
@@ -216,6 +223,7 @@ onMounted(async () => {
   }
 
   await nextTick()
+  window.addEventListener('resize', handleWindowResize)
 
   try {
       emmetHTML(monaco, ['html'])
@@ -373,6 +381,9 @@ onUnmounted(() => {
   clearTimeout(reconnectTimer)
   clearTimeout(previewTimer)
 
+  stopResize()
+  window.removeEventListener('resize', handleWindowResize)
+
   // ← НОВОЕ: очищаем свой курсор при уходе
   send({ type: 'cursor-clear' })
   for (const uid of [...remoteCaretWidgets.keys()]) {
@@ -383,8 +394,6 @@ onUnmounted(() => {
   decorationsCollection = null
   ws?.close()
   ws = null
-  document.removeEventListener('mousemove', onResize)
-  document.removeEventListener('mouseup', stopResize)
 })
 
 function getLang(name) {
@@ -476,6 +485,10 @@ watch(canEdit, (val) => {
 // Предпросмотр обновляем только после паузы, а не на каждый символ.
 watch(files, schedulePreviewUpdate, { deep: true })
 
+watch(showPreview, (visible) => {
+  if (visible) handleWindowResize()
+})
+
 async function connectWS() {
   if (!shouldReconnect) return
 
@@ -485,15 +498,28 @@ async function connectWS() {
   // Новая сессия — версию сбрасываем: сервер мог перезапуститься.
   participantsVersion.value = -1
   connectionStatus.value = reconnectAttempt > 0 ? 'reconnecting' : 'connecting'
+  connectError.value = ''
 
   const tokenReady = await ensureValidAccessToken()
-  if (!tokenReady || generation !== wsGeneration || !shouldReconnect) return
+  if (!tokenReady || generation !== wsGeneration || !shouldReconnect) {
+    // Без токена реконнект бессмысленен: оверлей не должен крутиться вечно.
+    if (!tokenReady) {
+      shouldReconnect = false
+      connectionStatus.value = 'error'
+      connectError.value = 'Сессия истекла. Войдите заново.'
+    }
+    return
+  }
 
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
   const token = localStorage.getItem('token')
-  const url = `${protocol}://${location.host}/ws/room/${roomId}?token=${token}`
+  const url = `${protocol}://${location.host}/ws/room/${roomId}`
 
-  const socket = new WebSocket(url)
+  // Токен передаём через Sec-WebSocket-Protocol, а не в query,
+  // чтобы он не попадал в access-логи nginx.
+  const socket = token
+    ? new WebSocket(url, [token])
+    : new WebSocket(url)
   ws = socket
 
   socket.onopen = () => {
@@ -510,72 +536,80 @@ async function connectWS() {
     if (data.type === 'room-state') {
       ignoreChanges = true
 
-      files.value = data.files || files.value
-      activeTab.value = data.activeTab || activeTab.value
-      showPreview.value = !!data.showPreview
-      if (data.showPreview) updatePreviewNow(true)
+      try {
+        files.value = data.files || files.value
+        activeTab.value = data.activeTab || activeTab.value
+        showPreview.value = !!data.showPreview
+        if (data.showPreview) updatePreviewNow(true)
 
-      // Кто сейчас редактирует
-      currentEditorId.value = data.currentEditor?.user_id ?? null
-      if (data.currentEditor) {
-        currentEditorName.value = data.currentEditor.username
-        canEdit.value = data.currentEditor.user_id === myUserId.value
-      } else {
-        currentEditorName.value = null
-        canEdit.value = false
-      }
-
-      // Хост
-      isHost.value = data.hostId === myUserId.value || data.isHost === true
-      hostId.value = data.hostId ?? null
-
-      // Участники — только если версия не старше уже применённой
-      const version = data.participantsVersion ?? 0
-      if (Array.isArray(data.participants) && version >= participantsVersion.value) {
-        participants.value = data.participants
-        participantsVersion.value = version
-      }
-
-      // Поднятые руки
-      if (data.raisedHands) {
-        raisedHands.value = data.raisedHands
-      }
-
-      // Текущие курсоры всех пользователей
-      if (data.cursors) {
-        remoteSelections.value = {}
-        for (const [uid, cursor] of Object.entries(data.cursors)) {
-          if (uid === String(myUserId.value)) continue
-          remoteSelections.value[uid] = {
-            username: cursor.username,
-            selection: cursor.selection,
-            color: cursor.color || getUserColor(uid)
-          }
-          ensureRemoteStyle(uid, remoteSelections.value[uid].color)
+        // Кто сейчас редактирует
+        currentEditorId.value = data.currentEditor?.user_id ?? null
+        if (data.currentEditor) {
+          currentEditorName.value = data.currentEditor.username
+          canEdit.value = data.currentEditor.user_id === myUserId.value
+        } else {
+          currentEditorName.value = null
+          canEdit.value = false
         }
-        updateRemoteDecorations()
-      }
 
-      if (editor) {
-        const newVal = files.value[activeTab.value] || ''
-        const lang = getLang(activeTab.value)
-        const model = editor.getModel()
+        // Хост
+        isHost.value = data.hostId === myUserId.value || data.isHost === true
+        hostId.value = data.hostId ?? null
 
-        if (model) {
-          // Меняем язык, если нужно
-          if (model.getLanguageId() !== lang) {
-            monaco.editor.setModelLanguage(model, lang)
+        // Участники — только если версия не старше уже применённой
+        const version = data.participantsVersion ?? 0
+        if (Array.isArray(data.participants) && version >= participantsVersion.value) {
+          participants.value = data.participants
+          participantsVersion.value = version
+        }
+
+        // Поднятые руки
+        if (data.raisedHands) {
+          raisedHands.value = data.raisedHands
+        }
+
+        // Текущие курсоры всех пользователей
+        if (data.cursors) {
+          remoteSelections.value = {}
+          for (const [uid, cursor] of Object.entries(data.cursors)) {
+            if (uid === String(myUserId.value)) continue
+            remoteSelections.value[uid] = {
+              username: cursor.username,
+              selection: cursor.selection,
+              color: cursor.color || getUserColor(uid)
+            }
+            ensureRemoteStyle(uid, remoteSelections.value[uid].color)
           }
-          // Меняем текст только если реально отличается
-          if (model.getValue() !== newVal) {
-            model.setValue(newVal)
+          updateRemoteDecorations()
+        }
+
+        if (editor) {
+          const newVal = files.value[activeTab.value] || ''
+          const lang = getLang(activeTab.value)
+          const model = editor.getModel()
+
+          if (model) {
+            // Меняем язык, если нужно
+            if (model.getLanguageId() !== lang) {
+              monaco.editor.setModelLanguage(model, lang)
+            }
+            // Меняем текст только если реально отличается
+            if (model.getValue() !== newVal) {
+              model.setValue(newVal)
+            }
           }
         }
+      } catch (err) {
+        // Ошибка в отрисовке состояния не должна означать «не подключились».
+        console.error('Не удалось применить room-state:', err)
+      } finally {
+        ignoreChanges = false
+        // Сокет уже открыт и состояние получено — оверлей убираем в любом
+        // случае, иначе он останется навсегда при неожиданном исключении.
+        connectionStatus.value = 'online'
+        reconnectAttempt = 0
       }
 
-      ignoreChanges = false
-      connectionStatus.value = 'online'
-      reconnectAttempt = 0
       return
     }
 
@@ -666,17 +700,37 @@ async function connectWS() {
     }
   }
 
-  socket.onclose = () => {
+  socket.onclose = (event) => {
     if (generation !== wsGeneration) return
 
-    console.log('WS отключён')
+    console.log('WS отключён', event.code, event.reason)
     remoteSelections.value = {}
     updateRemoteDecorations()
     ws = null
 
     if (!shouldReconnect) return
+
+    // Постоянные ошибки: реконнект их не исправит, а вечный спиннер
+    // скрывает причину.
+    if (PERMANENT_CLOSE_CODES.has(event.code)) {
+      shouldReconnect = false
+      connectionStatus.value = 'error'
+      connectError.value = describeClose(event)
+      return
+    }
+
     scheduleReconnect()
   }
+}
+
+// 4401/4403/4404 отдаёт сервер (RoomSession._reject), 1008 — старый вариант.
+const PERMANENT_CLOSE_CODES = new Set([4401, 4403, 4404, 1008])
+
+function describeClose(event) {
+  if (event.code === 4401) return 'Не удалось подтвердить сессию. Войдите заново.'
+  if (event.code === 4403) return 'Подключение с этого адреса запрещено сервером.'
+  if (event.code === 4404) return 'Комната не найдена или удалена.'
+  return event.reason || 'Не удалось подключиться к комнате.'
 }
 
 function scheduleReconnect() {
@@ -804,30 +858,83 @@ function updateRemoteDecorations() {
 }
 
 // ===== Resizer =====
+function getMaxPreviewWidth() {
+  const areaWidth = editorArea.value?.clientWidth || window.innerWidth
+  return Math.max(MIN_PREVIEW_WIDTH, areaWidth - MIN_EDITOR_WIDTH - 6)
+}
+
+function scheduleEditorLayout() {
+  if (layoutFrame !== null) return
+
+  layoutFrame = requestAnimationFrame(() => {
+    layoutFrame = null
+    editor?.layout()
+  })
+}
+
 function startResize(e) {
+  if (e.button !== 0 || isResizing.value) return
+
   isResizing.value = true
+  resizeStartX = e.clientX
+  resizeStartWidth = previewWidth.value
+
   document.body.style.cursor = 'col-resize'
   document.body.style.userSelect = 'none'
-  document.addEventListener('mousemove', onResize)
-  document.addEventListener('mouseup', stopResize)
+
+  window.addEventListener('mousemove', onResize)
+  window.addEventListener('mouseup', stopResize)
+  window.addEventListener('blur', stopResize)
+  document.documentElement.addEventListener('mouseleave', stopResize)
+
   e.preventDefault()
 }
 
 function onResize(e) {
   if (!isResizing.value) return
-  const newWidth = window.innerWidth - e.clientX - 300
-  if (newWidth >= 250 && newWidth <= window.innerWidth - 500) {
-    previewWidth.value = newWidth
+
+  const delta = resizeStartX - e.clientX
+  const maxWidth = getMaxPreviewWidth()
+  const nextWidth = Math.min(
+    Math.max(resizeStartWidth + delta, MIN_PREVIEW_WIDTH),
+    maxWidth
+  )
+
+  if (nextWidth !== previewWidth.value) {
+    previewWidth.value = nextWidth
+    scheduleEditorLayout()
   }
 }
 
 function stopResize() {
+  if (!isResizing.value) return
+
   isResizing.value = false
   document.body.style.cursor = ''
   document.body.style.userSelect = ''
-  document.removeEventListener('mousemove', onResize)
-  document.removeEventListener('mouseup', stopResize)
-  if (editor) editor.layout()
+
+  window.removeEventListener('mousemove', onResize)
+  window.removeEventListener('mouseup', stopResize)
+  window.removeEventListener('blur', stopResize)
+  document.documentElement.removeEventListener('mouseleave', stopResize)
+
+  if (layoutFrame !== null) {
+    cancelAnimationFrame(layoutFrame)
+    layoutFrame = null
+  }
+
+  editor?.layout()
+}
+
+function handleWindowResize() {
+  if (window.innerWidth <= 900) return
+
+  const maxWidth = getMaxPreviewWidth()
+
+  if (previewWidth.value > maxWidth) {
+    previewWidth.value = maxWidth
+    editor?.layout()
+  }
 }
 
 // ===== Действия =====
@@ -916,7 +1023,7 @@ function revokeEdit() {
           </div>
         </div>
 
-        <div class="editor-area">
+        <div ref="editorArea" class="editor-area">
           <div id="editor" class="editor"></div>
 
           <div v-if="showPreview" class="resizer" @mousedown="startResize"></div>
@@ -926,10 +1033,13 @@ function revokeEdit() {
               <span class="preview-title"><span class="preview-dot"></span> Результат</span>
               <button v-if="canEdit" class="icon-btn" @click="togglePreview" title="Закрыть">×</button>
             </div>
+            <!-- allow-same-origin намеренно не включён: пользовательский код
+                 не должен получать доступ к localStorage и DOM родителя. -->
             <iframe
               :key="previewKey"
               :srcdoc="previewHtml"
-              sandbox="allow-scripts allow-modals allow-forms allow-same-origin"
+              sandbox="allow-scripts allow-modals allow-forms"
+              referrerpolicy="no-referrer"
               class="preview-frame"
               title="Code Preview"
             ></iframe>
@@ -992,6 +1102,8 @@ function revokeEdit() {
       </aside>
     </div>
 
+    <div v-if="isResizing" class="resize-shield" aria-hidden="true"></div>
+
     <div
       v-if="connectionStatus !== 'online'"
       class="room-overlay"
@@ -999,12 +1111,21 @@ function revokeEdit() {
       aria-live="polite"
     >
       <div class="room-overlay-card">
-        <span class="spinner" aria-hidden="true"></span>
+        <span v-if="connectionStatus !== 'error'" class="spinner" aria-hidden="true"></span>
         <p class="room-overlay-text">
           {{ connectionStatus === 'reconnecting'
             ? 'Соединение потеряно. Переподключаемся…'
-            : 'Подключаемся к комнате…' }}
+            : connectionStatus === 'error'
+              ? connectError
+              : 'Подключаемся к комнате…' }}
         </p>
+        <RouterLink
+          v-if="connectionStatus === 'error'"
+          to="/"
+          class="btn btn-ghost btn-sm"
+        >
+          На главную
+        </RouterLink>
       </div>
     </div>
   </div>
@@ -1472,6 +1593,13 @@ function revokeEdit() {
   .room-status {
     width: 100%;
   }
+}
+
+.resize-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  cursor: col-resize;
 }
 
 .room-overlay {

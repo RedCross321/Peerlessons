@@ -1,0 +1,287 @@
+# Peerlessons — hardened Nginx config.
+#
+# Требуется nginx >= 1.25.1 (директива `http2 on`).
+#
+# Файл рассчитан на подключение в http-контекст
+# (например, /etc/nginx/conf.d/peerlessons.conf).
+#
+# Перед использованием:
+#   1. Скопируйте security-headers.conf.example в
+#      /etc/nginx/snippets/peerlessons-security-headers.conf
+#   2. Проверьте домен, пути к сертификатам, root и backend.
+#   3. nginx -t && systemctl reload nginx
+#
+# ВАЖНО: SITE_URL в backend/.env и VITE_SITE_URL во фронтенде
+# должны совпадать с canonical-доменом: https://www.peerlessons.ru
+
+server_tokens off;
+
+# Логи без query string: в URL подтверждения почты бывают одноразовые токены.
+log_format peer_secure '$remote_addr - $remote_user [$time_local] '
+                       '"$request_method $uri $server_protocol" '
+                       '$status $body_bytes_sent "$http_user_agent"';
+
+# Rate limiting (http-контекст).
+limit_req_zone $binary_remote_addr zone=peer_api:10m rate=30r/s;
+limit_req_zone $binary_remote_addr zone=peer_auth:10m rate=10r/m;
+limit_req_zone $binary_remote_addr zone=peer_room:10m rate=5r/m;
+limit_conn_zone $binary_remote_addr zone=peer_ws:10m;
+
+limit_req_status 429;
+limit_conn_status 429;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 5;
+gzip_min_length 1024;
+gzip_types
+    text/plain
+    text/css
+    application/json
+    application/javascript
+    application/xml
+    image/svg+xml;
+
+# ---------------------------------------------------------------
+# Default servers: unknown Host / unknown SNI are rejected.
+# ---------------------------------------------------------------
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    return 444;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     /etc/letsencrypt/live/peerlessons.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/peerlessons.ru/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    return 444;
+}
+
+# ---------------------------------------------------------------
+# HTTP -> canonical HTTPS (www)
+# ---------------------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name peerlessons.ru www.peerlessons.ru;
+
+    access_log /var/log/nginx/peerlessons.access.log peer_secure;
+
+    include /etc/nginx/snippets/peerlessons-security-headers.conf;
+
+    return 301 https://www.peerlessons.ru$request_uri;
+}
+
+# ---------------------------------------------------------------
+# Apex HTTPS -> www HTTPS
+# ---------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name peerlessons.ru;
+
+    access_log /var/log/nginx/peerlessons.access.log peer_secure;
+
+    ssl_certificate     /etc/letsencrypt/live/peerlessons.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/peerlessons.ru/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    include /etc/nginx/snippets/peerlessons-security-headers.conf;
+
+    return 301 https://www.peerlessons.ru$request_uri;
+}
+
+# ---------------------------------------------------------------
+# Main site
+# ---------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name www.peerlessons.ru;
+
+    access_log /var/log/nginx/peerlessons.access.log peer_secure;
+
+    root /var/www/peerlessons;
+    index index.html;
+
+    ssl_certificate     /etc/letsencrypt/live/peerlessons.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/peerlessons.ru/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    include /etc/nginx/snippets/peerlessons-security-headers.conf;
+
+    client_max_body_size 2m;
+    client_body_timeout 15s;
+    keepalive_timeout 30s;
+
+    # ----- Health -----
+    location = /health {
+        limit_req zone=peer_api burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+    }
+
+    # ----- Auth API: stricter rate limit -----
+    location ^~ /api/auth/ {
+        limit_req zone=peer_auth burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+    }
+
+    # ----- Account API: sensitive, stricter limit -----
+    location ^~ /api/account {
+        limit_req zone=peer_auth burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+    }
+
+    # ----- Room creation: prevent spam -----
+    location = /api/room {
+        limit_req zone=peer_room burst=5 nodelay;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+    }
+
+    # ----- REST API -----
+    location ^~ /api/ {
+        limit_req zone=peer_api burst=60 nodelay;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 60s;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+    }
+
+    # ----- WebSocket -----
+    location ^~ /ws/ {
+        limit_conn peer_ws 10;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Если бэкенд лежит, handshake должен падать быстро, а не висеть
+        # дефолтные 60 секунд (в браузере это выглядит как вечное
+        # «Подключаемся…»).
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+    }
+
+    location ~ ^/(login|register|verify-email|account|create-room|room/) {
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+
+        try_files $uri /index.html;
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location ~* \.(?:js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
+        add_header Cache-Control "public, max-age=2592000, immutable" always;
+        include /etc/nginx/snippets/peerlessons-security-headers.conf;
+
+        try_files $uri =404;
+    }
+}

@@ -4,6 +4,8 @@ import { isLoggedIn } from '@/auth'
 import CreateRoom from '@/views/CreateRoom.vue'
 import LoginPage from '@/views/LoginPage.vue'
 import RegisterPage from '@/views/RegisterPage.vue'
+import VerifyEmailPage from '@/views/VerifyEmailPage.vue'
+import AccountPage from '@/views/AccountPage.vue'
 import HomePage from '@/views/HomePage.vue'
 
 const router = createRouter({
@@ -26,6 +28,17 @@ const router = createRouter({
       name: "reg-page",
       component: RegisterPage,
       meta: { public: true, guestOnly: true }
+    },
+    {
+      path: '/verify-email',
+      name: 'verify-email',
+      component: VerifyEmailPage,
+      meta: { public: true }
+    },
+    {
+      path: '/account',
+      name: 'account',
+      component: AccountPage
     },
     {
       path: '/create-room',

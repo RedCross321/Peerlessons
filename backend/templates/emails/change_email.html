@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Подтверждение новой почты — Peerlessons</title>
+</head>
+<body style="margin:0;padding:0;background:#090b10;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;">
+    Код подтверждения новой почты Peerlessons: {{ code }}
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#090b10;padding:32px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#121620;border:1px solid #222a39;border-radius:16px;">
+          <tr>
+            <td style="padding:28px 32px 8px;">
+              <table role="presentation" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="width:34px;height:34px;background:#ff7a45;border-radius:10px;color:#15100d;font-family:ui-monospace,Menlo,monospace;font-size:18px;font-weight:700;text-align:center;vertical-align:middle;">/</td>
+                  <td style="padding-left:12px;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:18px;font-weight:700;color:#f3f5f9;">Peerlessons</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:8px 32px 0;">
+              <h1 style="margin:0 0 12px;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:26px;line-height:1.2;color:#f3f5f9;">Подтвердите новую почту</h1>
+              <p style="margin:0 0 18px;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:15px;line-height:1.6;color:#9aa4b6;">
+                Здравствуйте, {{ username }}! Вы меняете почту в Peerlessons на
+                <b style="color:#f3f5f9;">{{ new_email }}</b>. Введите код на сайте:
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" style="padding:0 32px;">
+              <div style="display:inline-block;padding:16px 24px;background:#0d1017;border:1px solid #222a39;border-radius:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:34px;font-weight:700;letter-spacing:10px;color:#ff7a45;">
+                {{ code }}
+              </div>
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" style="padding:24px 32px 0;">
+              <a href="{{ link }}" style="display:inline-block;padding:14px 24px;background:#ff7a45;border-radius:10px;color:#15100d;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:15px;font-weight:700;text-decoration:none;">
+                Подтвердить новую почту
+              </a>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:18px 32px 0;">
+              <p style="margin:0 0 8px;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:13px;line-height:1.6;color:#6d7789;">
+                Или откройте ссылку:
+              </p>
+              <p style="margin:0;font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.6;color:#9aa4b6;word-break:break-all;">
+                {{ link }}
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:20px 32px 0;">
+              <p style="margin:0;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:13px;line-height:1.6;color:#9aa4b6;">
+                Код и ссылка действуют {{ expires_minutes }} минут. Если вы не
+                запрашивали изменение, просто проигнорируйте письмо — текущая
+                почта останется прежней.
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:28px 32px 30px;border-top:1px solid #222a39;">
+              <p style="margin:0;font-family:Manrope,-apple-system,'Segoe UI',sans-serif;font-size:12px;line-height:1.6;color:#6d7789;">
+                Peerlessons · совместное редактирование кода<br>
+                <a href="{{ site_url }}" style="color:#9aa4b6;text-decoration:none;">{{ site_url }}</a> · {{ from_email }}
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

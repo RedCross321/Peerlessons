@@ -52,6 +52,9 @@ function handleLogout() {
           <RouterLink to="/create-room" class="btn btn-primary btn-lg">
             Создать комнату
           </RouterLink>
+          <RouterLink to="/account" class="btn btn-secondary btn-lg">
+            Личный кабинет
+          </RouterLink>
           <button
             type="button"
             class="btn btn-ghost btn-lg btn-logout"

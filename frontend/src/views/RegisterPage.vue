@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import api, { saveAuth } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
+import TurnstileCaptcha from '@/components/TurnstileCaptcha.vue'
 import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
 
@@ -15,6 +16,10 @@ const fieldErrors = ref({})
 const errorMessages = ref([])
 const successMessage = ref('')
 const isLoading = ref(false)
+const captchaSiteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY || ''
+const captchaToken = ref('')
+const captchaRef = ref(null)
+const needsVerification = ref(false)
 
 setPageSeo({
   title: 'Регистрация — Peerlessons',
@@ -95,37 +100,66 @@ function validateForm() {
 const register_user = async () => {
   errorMessages.value = []
   successMessage.value = ''
+  needsVerification.value = false
 
   if (!validateForm()) return
+
+  if (captchaSiteKey && !captchaToken.value) {
+    errorMessages.value = ['Подтвердите, что вы не робот']
+    return
+  }
 
   isLoading.value = true
 
   try {
-    await api.post('/auth/register', {
+    const { data } = await api.post('/auth/register', {
       username: username.value.trim(),
       email: email.value.trim(),
-      password: password.value
+      password: password.value,
+      captcha_token: captchaToken.value || null
     })
 
-    const { data: loginData } = await api.post('/auth/login', {
-      email: email.value.trim(),
-      password: password.value
-    }, {
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    })
+    if (data.status === 'pending') {
+      successMessage.value = `Мы отправили код на ${data.email || email.value.trim()}`
 
-    saveAuth(loginData.access_token, loginData.refresh_token, loginData.user)
+      setTimeout(() => {
+        router.replace({
+          name: 'verify-email',
+          query: {
+            email: data.email || email.value.trim(),
+            ...(redirectTarget.value
+              ? { redirect: redirectTarget.value }
+              : {}),
+            resend_after: String(data.resend_after || 60),
+            expires_in: String(data.expires_in || 900)
+          }
+        })
+      }, 600)
 
-    successMessage.value = 'Регистрация успешна! Переходим...'
+      return
+    }
 
-    setTimeout(() => {
-      router.replace(redirectTarget.value || '/')
-    }, 800)
+    if (data.access_token) {
+      saveAuth(data.access_token, data.refresh_token, data.user)
+      successMessage.value = 'Регистрация успешна! Переходим...'
+
+      setTimeout(() => {
+        router.replace(redirectTarget.value || '/')
+      }, 800)
+
+      return
+    }
+
+    errorMessages.value = ['Неожиданный ответ сервера. Попробуйте позже.']
   } catch (err) {
-    console.error('Ошибка при регистрации/входе:', err)
-    errorMessages.value = getErrorMessages(err, 'Не удалось зарегистрироваться')
+    console.error('Ошибка регистрации:', err)
+    needsVerification.value = err.response?.status === 409
+    errorMessages.value = getErrorMessages(
+      err,
+      'Не удалось зарегистрироваться'
+    )
+    captchaRef.value?.reset()
+    captchaToken.value = ''
   } finally {
     isLoading.value = false
   }
@@ -148,6 +182,12 @@ const register_user = async () => {
       <div v-if="successMessage" class="alert alert-success" role="alert">
         {{ successMessage }}
       </div>
+
+      <p v-if="needsVerification" class="auth-footer">
+        <RouterLink :to="{ name: 'verify-email', query: { email } }">
+          Перейти к подтверждению почты
+        </RouterLink>
+      </p>
 
       <form class="auth-form" novalidate @submit.prevent="register_user">
         <div class="field">
@@ -231,6 +271,13 @@ const register_user = async () => {
             Пароли не совпадают
           </div>
         </div>
+
+        <TurnstileCaptcha
+          v-if="captchaSiteKey"
+          ref="captchaRef"
+          :site-key="captchaSiteKey"
+          @verified="captchaToken = $event"
+        />
 
         <button
           type="submit"
