@@ -1,5 +1,6 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useTheme } from '@/theme'
 
 const props = defineProps({
   siteKey: {
@@ -9,6 +10,8 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['verified'])
+
+const { resolvedTheme } = useTheme()
 
 const container = ref(null)
 let widgetId = null
@@ -42,7 +45,7 @@ async function renderWidget() {
 
     widgetId = turnstile.render(container.value, {
       sitekey: props.siteKey,
-      theme: 'dark',
+      theme: resolvedTheme.value === 'light' ? 'light' : 'dark',
       language: 'ru',
       size: 'flexible',
       callback: (token) => emit('verified', token),
@@ -64,6 +67,16 @@ function reset() {
 }
 
 onMounted(renderWidget)
+
+// Виджет Turnstile не умеет менять тему на лету — перерисовываем его.
+watch(resolvedTheme, () => {
+  if (widgetId !== null && window.turnstile) {
+    window.turnstile.remove(widgetId)
+  }
+  widgetId = null
+  emit('verified', '')
+  renderWidget()
+})
 
 onBeforeUnmount(() => {
   if (widgetId !== null && window.turnstile) {

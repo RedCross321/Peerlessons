@@ -13,6 +13,7 @@ function buildSeoFiles(siteUrl, repoUrl) {
     'Disallow: /room/',
     'Disallow: /create-room',
     'Disallow: /account',
+    'Disallow: /settings',
     'Disallow: /verify-email',
     'Disallow: /api/',
     'Disallow: /ws/',
@@ -96,6 +97,28 @@ ${repoLine}- Главная: ${siteUrl}/
   <link rel="canonical" href="${siteUrl}/about/">
   <link rel="icon" href="/favicon.ico">
   <meta name="theme-color" content="#090b10">
+  <script>
+    (function () {
+      try {
+        var stored = localStorage.getItem('peerlessons-theme');
+        var theme =
+          stored === 'light' || stored === 'dark'
+            ? stored
+            : window.matchMedia &&
+                window.matchMedia('(prefers-color-scheme: light)').matches
+              ? 'light'
+              : 'dark';
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) {
+          meta.setAttribute('content', theme === 'light' ? '#f4f5f8' : '#090b10');
+        }
+      } catch (error) {
+        document.documentElement.dataset.theme = 'dark';
+      }
+    })();
+  </script>
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Peerlessons">
   <meta property="og:locale" content="ru_RU">
@@ -145,6 +168,7 @@ ${repoLine}- Главная: ${siteUrl}/
       --bg: #090b10;
       --surface: #121620;
       --border: #222a39;
+      --border-strong: #303a4d;
       --text: #f3f5f9;
       --muted: #9aa4b6;
       --dim: #6d7789;
@@ -152,9 +176,23 @@ ${repoLine}- Главная: ${siteUrl}/
       --accent-strong: #ff9163;
     }
 
+    :root[data-theme='light'] {
+      --bg: #f4f5f8;
+      --surface: #ffffff;
+      --border: #dfe3ea;
+      --border-strong: #c8cfda;
+      --text: #171a21;
+      --muted: #5b6474;
+      --dim: #79828f;
+      --accent: #de5a22;
+      --accent-strong: #c44a17;
+    }
+
     * { box-sizing: border-box; }
 
     html { color-scheme: dark; }
+
+    html[data-theme='light'] { color-scheme: light; }
 
     body {
       margin: 0;
@@ -218,7 +256,7 @@ ${repoLine}- Главная: ${siteUrl}/
     .btn-primary { background: var(--accent); color: #15100d; }
     .btn-primary:hover { background: var(--accent-strong); color: #15100d; }
     .btn-ghost { border-color: var(--border); color: var(--muted); }
-    .btn-ghost:hover { color: var(--text); border-color: #303a4d; }
+    .btn-ghost:hover { color: var(--text); border-color: var(--border-strong); }
     .btn-lg { padding: 14px 24px; border-radius: 10px; font-size: 15px; }
 
     main {

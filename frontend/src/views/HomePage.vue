@@ -93,8 +93,8 @@ async function join() {
           <RouterLink to="/create-room" class="btn btn-primary btn-lg">
             Создать комнату
           </RouterLink>
-          <RouterLink to="/account" class="btn btn-secondary btn-lg">
-            Личный кабинет
+          <RouterLink to="/settings" class="btn btn-secondary btn-lg">
+            Настройки
           </RouterLink>
           <button
             type="button"

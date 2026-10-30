@@ -306,6 +306,11 @@ class ConnectionManager:
                 "raisedHands": [],  # [{user_id, username}]
                 "currentEditorId": None,  # актуальный редактор для всех соединений
                 "participantsVersion": 0,
+                "annotations": [],  # пометки на коде
+                "annotationBans": set(),  # кому запрещено создавать пометки
+                "annotationsLocked": False,  # True — пометки создаёт только ведущий
+                "previewMode": "individual",  # individual | shared
+                "previewEvents": [],  # журнал взаимодействий с общим превью
             }
         return self.room_state[room_id]
 
@@ -416,8 +421,99 @@ class ConnectionManager:
                         f"Ошибка отправки сообщения пользователю {user_id}"
                     )
 
+    async def close_user(
+        self, room_id: str, user_id: int, code: int = 4003, reason: str = ""
+    ) -> None:
+        """Закрывает все WebSocket-соединения пользователя в комнате."""
+        for p in list(self.rooms.get(room_id, [])):
+            if p["user_id"] != user_id:
+                continue
+            try:
+                await p["websocket"].close(code=code, reason=reason)
+            except Exception:
+                logger.debug(
+                    f"Не удалось закрыть соединение пользователя {user_id} "
+                    f"в комнате {room_id}"
+                )
+
 
 manager = ConnectionManager()
+
+# Ограничения на пометки, чтобы комната не могла раздуть память.
+MAX_ANNOTATION_TEXT = 600
+MAX_ANNOTATIONS_PER_ROOM = 200
+
+# Журнал взаимодействий с общим превью и допустимые действия.
+MAX_PREVIEW_EVENTS = 300
+PREVIEW_ACTIONS = {"click", "input", "change", "keydown", "keyup"}
+
+# Файлы комнаты: имя и расширение, лимит количества.
+FILE_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(html|css|js)$",
+    re.IGNORECASE,
+)
+MAX_ROOM_FILES = 30
+
+
+def normalize_file_name(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def is_valid_file_name(name: str) -> bool:
+    return (
+        bool(name)
+        and len(name) <= 64
+        and FILE_NAME_PATTERN.match(name) is not None
+    )
+
+
+def default_file_content(name: str) -> str:
+    lower = name.lower()
+    if lower.endswith(".html"):
+        return (
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>\n"
+            '  <meta charset="UTF-8">\n'
+            f"  <title>{name}</title>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <h1>Новая страница</h1>\n"
+            "</body>\n"
+            "</html>\n"
+        )
+    if lower.endswith(".css"):
+        return "/* Новый файл стилей */\n"
+    return "// Новый файл скрипта\n"
+
+
+def valid_annotation_selection(selection: Any) -> dict[str, int] | None:
+    """Проверяет и нормализует диапазон выделения из WebSocket-сообщения."""
+    if not isinstance(selection, dict):
+        return None
+
+    keys = ("startLineNumber", "startColumn", "endLineNumber", "endColumn")
+    values: dict[str, int] = {}
+    for key in keys:
+        value = selection.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return None
+        values[key] = value
+
+    if (values["startLineNumber"], values["startColumn"]) > (
+        values["endLineNumber"],
+        values["endColumn"],
+    ):
+        return None
+
+    # Пустое выделение пометить нельзя.
+    if (
+        values["startLineNumber"] == values["endLineNumber"]
+        and values["startColumn"] == values["endColumn"]
+    ):
+        return None
+
+    return values
 
 
 def get_websocket_user(token: str | None, db: Session) -> User:
@@ -1440,6 +1536,10 @@ class RoomSession:
         match data.get("type"):
             case "code-update":
                 await self._handle_code_update(data)
+            case "file-create":
+                await self._handle_file_create(data)
+            case "file-delete":
+                await self._handle_file_delete(data)
             case "raise-hand":
                 await self._handle_raise_hand()
             case "lower-hand":
@@ -1448,6 +1548,22 @@ class RoomSession:
                 await self._handle_grant_edit(data)
             case "revoke-edit":
                 await self._handle_revoke_edit()
+            case "kick-user":
+                await self._handle_kick_user(data)
+            case "annotation-add":
+                await self._handle_annotation_add(data)
+            case "annotation-remove":
+                await self._handle_annotation_remove(data)
+            case "annotation-clear":
+                await self._handle_annotation_clear()
+            case "annotation-ban":
+                await self._handle_annotation_ban(data)
+            case "annotation-lock":
+                await self._handle_annotation_lock(data)
+            case "preview-mode":
+                await self._handle_preview_mode(data)
+            case "preview-interaction":
+                await self._handle_preview_interaction(data)
             case "preview-toggle":
                 await self._handle_preview_toggle(data)
             case "preview-refresh":
@@ -1475,12 +1591,54 @@ class RoomSession:
             return
 
         room = self.current_room
+        incoming_files = data.get("files")
+        if not isinstance(incoming_files, dict):
+            return
+
+        current_code = (
+            room.current_code if isinstance(room.current_code, dict) else {}
+        )
+        current_files = current_code.get("files")
+        if not isinstance(current_files, dict):
+            current_files = {}
+
+        # Менять состав файлов может только ведущий через file-create/
+        # file-delete. Редактор обновляет только содержимое существующих.
+        if current_files:
+            merged_files: dict[str, str] = {}
+            for name, content in current_files.items():
+                incoming = incoming_files.get(name)
+                merged_files[name] = (
+                    incoming if isinstance(incoming, str) else str(content)
+                )
+        else:
+            merged_files = {
+                name: content
+                for name, content in incoming_files.items()
+                if isinstance(name, str) and isinstance(content, str)
+            }
+
+        if not merged_files:
+            return
+
+        active_tab = data.get("activeTab")
+        if not isinstance(active_tab, str) or active_tab not in merged_files:
+            active_tab = (
+                "index.html"
+                if "index.html" in merged_files
+                else next(iter(merged_files))
+            )
+
         new_code: dict[str, Any] = {
-            "files": data.get("files", {}),
-            "activeTab": data.get("activeTab", "index.html"),
+            "files": merged_files,
+            "activeTab": active_tab,
         }
         room.current_code = new_code
         await debounce_saver.schedule_save(self.room_id, new_code)
+
+        if self.state.get("previewMode") == "shared":
+            # Превью перезагрузится у всех — старый журнал больше не актуален.
+            self.state["previewEvents"] = []
 
         await manager.broadcast(
             self.room_id,
@@ -1490,6 +1648,113 @@ class RoomSession:
                 "activeTab": new_code["activeTab"],
             },
             exclude=self.websocket,
+        )
+
+    async def _send_file_error(self, reason: str) -> None:
+        try:
+            await self.websocket.send_json(
+                {"type": "file-error", "reason": reason}
+            )
+        except Exception:
+            pass
+
+    async def _handle_file_create(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        name = normalize_file_name(data.get("name"))
+        if not is_valid_file_name(name):
+            await self._send_file_error(
+                "Имя должно быть латиницей и заканчиваться на .html, .css или .js"
+            )
+            return
+
+        room = self.current_room
+        safe_code = room.current_code if isinstance(room.current_code, dict) else {}
+        files = safe_code.get("files")
+        files = dict(files) if isinstance(files, dict) else {}
+
+        if len(files) >= MAX_ROOM_FILES:
+            await self._send_file_error("Достигнут лимит файлов")
+            return
+
+        if any(existing.lower() == name.lower() for existing in files):
+            await self._send_file_error("Файл с таким именем уже существует")
+            return
+
+        files[name] = default_file_content(name)
+
+        active_tab = safe_code.get("activeTab")
+        if not isinstance(active_tab, str) or active_tab not in files:
+            active_tab = "index.html" if "index.html" in files else name
+
+        new_code = {"files": files, "activeTab": active_tab}
+        room.current_code = new_code
+        await debounce_saver.schedule_save(self.room_id, new_code)
+
+        if self.state.get("previewMode") == "shared":
+            self.state["previewEvents"] = []
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "files-update", "files": files, "activeTab": active_tab},
+        )
+
+    async def _handle_file_delete(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        raw_name = normalize_file_name(data.get("name"))
+        if not raw_name:
+            return
+
+        room = self.current_room
+        safe_code = room.current_code if isinstance(room.current_code, dict) else {}
+        files = safe_code.get("files")
+        files = dict(files) if isinstance(files, dict) else {}
+
+        actual_name = next(
+            (name for name in files if name.lower() == raw_name.lower()),
+            None,
+        )
+        if actual_name is None:
+            await self._send_file_error("Файл не найден")
+            return
+
+        if len(files) <= 1:
+            await self._send_file_error("Нельзя удалить последний файл")
+            return
+
+        files.pop(actual_name, None)
+
+        active_tab = safe_code.get("activeTab")
+        if not isinstance(active_tab, str) or active_tab not in files:
+            active_tab = (
+                "index.html"
+                if "index.html" in files
+                else next(iter(files))
+            )
+
+        new_code = {"files": files, "activeTab": active_tab}
+        room.current_code = new_code
+        await debounce_saver.schedule_save(self.room_id, new_code)
+
+        # Пометки удалённого файла больше некуда привязывать.
+        annotations = self.state.get("annotations", [])
+        remaining = [
+            annotation
+            for annotation in annotations
+            if annotation.get("file") != actual_name
+        ]
+        if len(remaining) != len(annotations):
+            self.state["annotations"] = remaining
+
+        if self.state.get("previewMode") == "shared":
+            self.state["previewEvents"] = []
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "files-update", "files": files, "activeTab": active_tab},
         )
 
     async def _handle_raise_hand(self) -> None:
@@ -1528,7 +1793,17 @@ class RoomSession:
         if self.current_room.host_id != self.user_id:
             return
 
-        target_id = data.get("user_id")
+        try:
+            target_id = int(data.get("user_id"))
+        except (TypeError, ValueError):
+            return
+
+        # Выдавать права можно только тому, кто сейчас в комнате.
+        if not any(
+            p["user_id"] == target_id for p in manager.rooms.get(self.room_id, [])
+        ):
+            return
+
         self.current_room.current_editor_id = target_id
         self.db.commit()
         self.state["currentEditorId"] = target_id
@@ -1597,21 +1872,291 @@ class RoomSession:
             },
         )
 
+    async def _handle_kick_user(self, data: dict[str, Any]) -> None:
+        host_id = self.current_room.host_id
+        if host_id != self.user_id:
+            return
+
+        try:
+            target_id = int(data.get("user_id"))
+        except (TypeError, ValueError):
+            return
+
+        # Ведущего исключить нельзя, и только подключённого пользователя.
+        if target_id == host_id:
+            return
+
+        if not any(
+            p["user_id"] == target_id for p in manager.rooms.get(self.room_id, [])
+        ):
+            return
+
+        # Если исключаем текущего редактора — права возвращаются ведущему.
+        if self.state.get("currentEditorId") == target_id:
+            self.current_room.current_editor_id = host_id
+            self.db.commit()
+            self.state["currentEditorId"] = host_id
+
+            host_name = next(
+                (
+                    p["username"]
+                    for p in manager.get_participants(self.room_id)
+                    if p["user_id"] == host_id
+                ),
+                "Ведущий",
+            )
+            await manager.broadcast(
+                self.room_id,
+                {
+                    "type": "editor-changed",
+                    "user_id": host_id,
+                    "username": host_name,
+                },
+            )
+
+        had_raised_hand = any(
+            h["user_id"] == target_id for h in self.state["raisedHands"]
+        )
+
+        self.state["cursors"].pop(str(target_id), None)
+        self.state["raisedHands"] = [
+            h for h in self.state["raisedHands"] if h["user_id"] != target_id
+        ]
+
+        if had_raised_hand:
+            await manager.broadcast(
+                self.room_id,
+                {"type": "hand-lowered", "user_id": target_id},
+            )
+
+        await manager.send_to_user(
+            self.room_id,
+            target_id,
+            {"type": "kicked", "reason": "Ведущий исключил вас из комнаты."},
+        )
+        await manager.close_user(self.room_id, target_id)
+
+    # ---------- пометки на коде ----------
+
+    def _annotation_allowed(self) -> bool:
+        # Ведущий может создавать пометки всегда, остальные — под ограничениями.
+        if self.current_room.host_id == self.user_id:
+            return True
+        if self.state.get("annotationsLocked"):
+            return False
+        return self.user_id not in self.state.get("annotationBans", set())
+
+    async def _handle_annotation_add(self, data: dict[str, Any]) -> None:
+        if not self._annotation_allowed():
+            await self.websocket.send_json(
+                {
+                    "type": "annotation-denied",
+                    "reason": "Ведущий ограничил создание пометок.",
+                }
+            )
+            return
+
+        file_name = data.get("file")
+        if not isinstance(file_name, str):
+            return
+
+        safe_code = self.current_room.current_code
+        files = safe_code.get("files", {}) if isinstance(safe_code, dict) else {}
+        if not isinstance(files, dict) or file_name not in files:
+            return
+
+        selection = valid_annotation_selection(data.get("selection"))
+        if selection is None:
+            return
+
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return
+        text = text[:MAX_ANNOTATION_TEXT]
+
+        annotations = self.state.setdefault("annotations", [])
+        if len(annotations) >= MAX_ANNOTATIONS_PER_ROOM:
+            await self.websocket.send_json(
+                {
+                    "type": "annotation-denied",
+                    "reason": "В комнате уже слишком много пометок.",
+                }
+            )
+            return
+
+        annotation = {
+            "id": uuid4().hex,
+            "user_id": self.user_id,
+            "username": self.username,
+            "file": file_name,
+            "selection": selection,
+            "text": text,
+        }
+        annotations.append(annotation)
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "annotation-added", "annotation": annotation},
+        )
+
+    async def _handle_annotation_remove(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        annotation_id = data.get("id")
+        if not isinstance(annotation_id, str) or not annotation_id:
+            return
+
+        annotations = self.state.get("annotations", [])
+        remaining = [a for a in annotations if a.get("id") != annotation_id]
+        if len(remaining) == len(annotations):
+            return
+
+        self.state["annotations"] = remaining
+        await manager.broadcast(
+            self.room_id,
+            {"type": "annotation-removed", "id": annotation_id},
+        )
+
+    async def _handle_annotation_clear(self) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        if not self.state.get("annotations"):
+            return
+
+        self.state["annotations"] = []
+        await manager.broadcast(self.room_id, {"type": "annotations-cleared"})
+
+    async def _handle_annotation_ban(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        try:
+            target_id = int(data.get("user_id"))
+        except (TypeError, ValueError):
+            return
+
+        if target_id == self.current_room.host_id:
+            return
+
+        banned = bool(data.get("banned"))
+        bans = self.state.setdefault("annotationBans", set())
+        if banned:
+            bans.add(target_id)
+        else:
+            bans.discard(target_id)
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "annotation-ban",
+                "user_id": target_id,
+                "banned": banned,
+            },
+        )
+
+    async def _handle_annotation_lock(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        locked = bool(data.get("locked"))
+        self.state["annotationsLocked"] = locked
+        await manager.broadcast(
+            self.room_id,
+            {"type": "annotation-lock", "locked": locked},
+        )
+
+    async def _handle_preview_mode(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        mode = data.get("mode")
+        if mode not in ("individual", "shared"):
+            return
+
+        self.state["previewMode"] = mode
+        # При смене режима превью перезагружается у всех — журнал начинаем заново.
+        self.state["previewEvents"] = []
+        await manager.broadcast(
+            self.room_id, {"type": "preview-mode", "mode": mode}
+        )
+
+    async def _handle_preview_interaction(self, data: dict[str, Any]) -> None:
+        if self.state.get("previewMode") != "shared":
+            return
+        if self.current_room.host_id != self.user_id:
+            return
+
+        event = data.get("event")
+        if not isinstance(event, dict):
+            return
+
+        action = event.get("action")
+        if action not in PREVIEW_ACTIONS:
+            return
+
+        path = event.get("path")
+        if not isinstance(path, str) or len(path) > 200:
+            return
+
+        safe_event: dict[str, Any] = {"action": action, "path": path}
+
+        value = event.get("value")
+        if isinstance(value, str):
+            safe_event["value"] = value[:1000]
+
+        checked = event.get("checked")
+        if isinstance(checked, bool):
+            safe_event["checked"] = checked
+
+        for key in ("key", "code"):
+            raw = event.get(key)
+            if isinstance(raw, str):
+                safe_event[key] = raw[:50]
+
+        for key in ("altKey", "ctrlKey", "metaKey", "shiftKey"):
+            raw = event.get(key)
+            if isinstance(raw, bool):
+                safe_event[key] = raw
+
+        events = self.state.setdefault("previewEvents", [])
+        events.append(safe_event)
+        if len(events) > MAX_PREVIEW_EVENTS:
+            del events[: len(events) - MAX_PREVIEW_EVENTS]
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "preview-interaction", "event": safe_event},
+            exclude=self.websocket,
+        )
+
     async def _handle_preview_toggle(self, data: dict[str, Any]) -> None:
-        # Окном результата управляет только текущий редактор.
-        if not self._is_current_editor():
+        # Окном результата управляют текущий редактор и ведущий.
+        if not (
+            self._is_current_editor()
+            or self.current_room.host_id == self.user_id
+        ):
             return
 
         show = bool(data.get("show", False))
         self.state["showPreview"] = show
 
-        await manager.broadcast(
-            self.room_id,
-            {"type": "preview-toggle", "show": show},
-            exclude=self.websocket,
-        )
+        message: dict[str, Any] = {"type": "preview-toggle", "show": show}
+        if show and self.state.get("previewMode") == "shared":
+            message["events"] = list(self.state.get("previewEvents", []))
+
+        # Отправитель тоже должен получить журнал взаимодействий.
+        await manager.broadcast(self.room_id, message)
 
     async def _handle_preview_refresh(self) -> None:
+        if self.state.get("previewMode") != "shared":
+            # В индивидуальном режиме каждый обновляет только свой результат.
+            return
+        if self.current_room.host_id != self.user_id:
+            return
+
+        self.state["previewEvents"] = []
         await manager.broadcast(
             self.room_id,
             {"type": "preview-refresh"},
@@ -1684,6 +2229,17 @@ class RoomSession:
                 "participants": participants,
                 "participantsVersion": self.state["participantsVersion"],
                 "raisedHands": self.state["raisedHands"],
+                "annotations": self.state.get("annotations", []),
+                "annotationsLocked": bool(
+                    self.state.get("annotationsLocked", False)
+                ),
+                "bannedAnnotationUserIds": sorted(
+                    self.state.get("annotationBans", set())
+                ),
+                "previewMode": self.state.get("previewMode", "individual"),
+                "previewEvents": list(self.state.get("previewEvents", []))
+                if self.state.get("previewMode") == "shared"
+                else [],
                 "cursors": self.state["cursors"],
             }
         )

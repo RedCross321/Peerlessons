@@ -5,6 +5,26 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" href="/favicon.ico" sizes="any">
     <meta name="theme-color" content="#090b10">
+    <script>
+      // Применяем тему до первой отрисовки, чтобы не было вспышки.
+      (function () {
+        try {
+          var stored = localStorage.getItem('peerlessons-theme')
+          var theme =
+            stored === 'light' || stored === 'dark'
+              ? stored
+              : window.matchMedia &&
+                  window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark'
+          document.documentElement.dataset.theme = theme
+          document.documentElement.style.colorScheme = theme
+        } catch (error) {
+          document.documentElement.dataset.theme = 'dark'
+          document.documentElement.style.colorScheme = 'dark'
+        }
+      })()
+    </script>
 
     <title>Peerlessons — совместное редактирование кода в реальном времени</title>
     <meta
@@ -79,6 +99,11 @@
       body {
         margin: 0;
         background: #090b10;
+      }
+
+      html[data-theme='light'],
+      html[data-theme='light'] body {
+        background: #f4f5f8;
       }
     </style>
   </head>

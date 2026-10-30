@@ -5,7 +5,7 @@ import CreateRoom from '@/views/CreateRoom.vue'
 import LoginPage from '@/views/LoginPage.vue'
 import RegisterPage from '@/views/RegisterPage.vue'
 import VerifyEmailPage from '@/views/VerifyEmailPage.vue'
-import AccountPage from '@/views/AccountPage.vue'
+import SettingsPage from '@/views/SettingsPage.vue'
 import HomePage from '@/views/HomePage.vue'
 
 const router = createRouter({
@@ -36,9 +36,10 @@ const router = createRouter({
       meta: { public: true }
     },
     {
-      path: '/account',
-      name: 'account',
-      component: AccountPage
+      path: '/settings',
+      alias: '/account',
+      name: 'settings',
+      component: SettingsPage,
     },
     {
       path: '/create-room',

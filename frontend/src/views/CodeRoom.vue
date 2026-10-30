@@ -5,11 +5,17 @@ import '@/monaco-workers'
 import * as monaco from 'monaco-editor'
 import { emmetHTML, emmetCSS, emmetJSX } from 'emmet-monaco-es'
 import api, { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
+import AnnotationPopup from '@/components/AnnotationPopup.vue'
+import FileActionDialog from '@/components/FileActionDialog.vue'
+import ParticipantMenu from '@/components/ParticipantMenu.vue'
+import { useTheme } from '@/theme'
 import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
 
 const route = useRoute()
 const router = useRouter()
+
+const { resolvedTheme } = useTheme()
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -69,6 +75,15 @@ document.querySelector("h1").addEventListener("click", () => {
 })
 
 const activeTab = ref('index.html')
+const hasEditorSelection = ref(false)
+
+const MAX_ROOM_FILES = 30
+const FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(html|css|js)$/i
+const filesCount = computed(() => Object.keys(files.value).length)
+// Вкладка, на которой сейчас редактор — нужна для режима слежения.
+const editorTab = ref('index.html')
+// Наблюдатель по умолчанию следует за редактором.
+const followEditor = ref(true)
 const canEdit = ref(false)
 const currentEditorName = ref(null)
 const currentEditorId = ref(null)
@@ -78,16 +93,86 @@ const connectionStatus = ref('connecting') // connecting | reconnecting | online
 const connectError = ref('')
 const raisedHands = ref([])
 
+// ===== Пометки на коде =====
+const annotations = ref([])
+const annotationsLocked = ref(false)
+// user_id, которым ведущий запретил создавать пометки.
+const annotationBans = ref([])
+const annotationDraft = ref(null)
+const annotationText = ref('')
+const annotationMessage = ref('')
+const annotationPopup = ref(null)
+const clearAnnotationsConfirm = ref(false)
+let annotationMessageTimer = null
+let clearAnnotationsTimer = null
+
+// ===== Диалог создания/удаления файла =====
+const fileDialog = ref(null)
+const fileDialogError = ref('')
+const fileDialogBusy = ref(false)
+let pendingCreatedFile = ''
+
+const ANNOTATION_POPUP_WIDTH = 300
+const ANNOTATION_POPUP_HEIGHT = 340
+
+const annotationDecorationHandles = new Map()
+// Актуальные позиции пометок с учётом правок кода (id -> selection).
+const annotationRanges = new Map()
+
+const annotationInput = ref(null)
+
 const hasRaisedHand = computed(() =>
   raisedHands.value.some(h => h.user_id === myUserId.value)
 )
 
+// Порядок поднятых рук = порядок поднятия; такие участники идут вверху списка.
+const raisedHandOrder = computed(() => {
+  const order = new Map()
+  raisedHands.value.forEach((entry, index) => {
+    order.set(entry.user_id, index)
+  })
+  return order
+})
+
+const sortedParticipants = computed(() => {
+  const order = raisedHandOrder.value
+
+  return [...participants.value].sort((a, b) => {
+    const aOrder = order.get(a.user_id)
+    const bOrder = order.get(b.user_id)
+
+    if (aOrder !== undefined && bOrder !== undefined) return aOrder - bOrder
+    if (aOrder !== undefined) return -1
+    if (bOrder !== undefined) return 1
+    return 0
+  })
+})
+
+const canAnnotate = computed(() => {
+  if (isHost.value) return true
+  if (annotationsLocked.value) return false
+  return !annotationBans.value.includes(myUserId.value)
+})
+
+const annotateTitle = computed(() => {
+  if (!canAnnotate.value) return 'Ведущий ограничил создание пометок'
+  if (!hasEditorSelection.value) return 'Сначала выделите фрагмент кода'
+  return 'Оставить пометку на выделенном коде'
+})
+
 // Предпросмотр
 const showPreview = ref(false)
+const previewMode = ref('individual')
+const previewReady = ref(false)
+let pendingPreviewEvents = []
 const previewKey = ref(0)
 const previewHtml = ref('')
 const previewFrame = ref(null)
 const previewShellUrl = `${import.meta.env.BASE_URL}preview.html`
+
+const canRefreshPreview = computed(
+  () => previewMode.value === 'individual' || isHost.value
+)
 const PREVIEW_DEBOUNCE_MS = 600
 const previewWidth = ref(400)
 const isResizing = ref(false)
@@ -112,6 +197,10 @@ let previewTimer = null
 let ignoreChanges = false
 
 // ===== Утилиты =====
+function monacoThemeId(value) {
+  return value === 'light' ? 'peerless-light' : 'peerless-dark'
+}
+
 function getUserColor(userId) {
   const colors = ['#e06c75', '#98c379', '#e5c07b', '#61afef', '#c678dd', '#56b6c2', '#d19a66', '#56b6c2']
   let hash = 0
@@ -153,20 +242,280 @@ function toRemoteSelection(sel) {
   }
 }
 
-function generatePreviewContent() {
-  let html = files.value['index.html'] || ''
-  const css = files.value['style.css'] || ''
-  const js = files.value['main.js'] || ''
+function buildPreviewInteractionScript() {
+  const mode =
+    previewMode.value === 'shared'
+      ? isHost.value
+        ? 'capture'
+        : 'replay'
+      : 'off'
 
-  html = html.replace(
-    /<link\s+rel=["']stylesheet["']\s+href=["']style\.css["']\s*\/?>/gi,
-    `<style>\n${css}\n</style>`
+  if (mode === 'off') return ''
+
+  return `
+<script>
+(function () {
+  var MODE = '${mode}';
+
+  function pathOf(element) {
+    var parts = [];
+    var node = element;
+    while (
+      node &&
+      node.nodeType === 1 &&
+      node !== document.documentElement &&
+      node.parentNode
+    ) {
+      var index = Array.prototype.indexOf.call(node.parentNode.children, node);
+      if (index < 0) return '';
+      parts.unshift(index);
+      node = node.parentNode;
+    }
+    return parts.join('/');
+  }
+
+  function elementAt(path) {
+    var node = document.documentElement;
+    if (!path) return node;
+    var parts = path.split('/');
+    for (var i = 0; i < parts.length; i += 1) {
+      node = node && node.children ? node.children[Number(parts[i])] : null;
+      if (!node) return null;
+    }
+    return node;
+  }
+
+  function post(payload) {
+    payload.source = 'peerlessons-preview';
+    try {
+      // Вложенное превью лежит внутри оболочки, но оболочка в sandbox
+      // имеет непрозрачный origin — надёжнее слать напрямую в окно приложения.
+      window.top.postMessage(payload, '*');
+    } catch (error) {
+      /* приложение недоступно */
+    }
+  }
+
+  function sendInteraction(detail) {
+    post({ action: 'interaction', event: detail });
+  }
+
+  if (MODE === 'capture') {
+    document.addEventListener('click', function (event) {
+      if (!event.isTrusted) return;
+      var target = event.target;
+      if (!target || target.nodeType !== 1) return;
+
+      var tag = target.tagName;
+      if (tag === 'SELECT' || tag === 'TEXTAREA') return;
+      if (tag === 'INPUT') {
+        var inputType = String(target.type || '').toLowerCase();
+        if (
+          ['button', 'submit', 'reset', 'image'].indexOf(inputType) === -1
+        ) {
+          return;
+        }
+      }
+
+      sendInteraction({ action: 'click', path: pathOf(target) });
+    }, true);
+
+    document.addEventListener('input', function (event) {
+      if (!event.isTrusted) return;
+      var target = event.target;
+      if (!target || target.nodeType !== 1) return;
+
+      var detail = { action: 'input', path: pathOf(target) };
+      if (typeof target.value === 'string') {
+        detail.value = target.value.slice(0, 2000);
+      } else if (target.isContentEditable) {
+        detail.value = String(target.textContent || '').slice(0, 2000);
+      }
+      if (typeof target.checked === 'boolean') detail.checked = target.checked;
+
+      sendInteraction(detail);
+    }, true);
+
+    document.addEventListener('change', function (event) {
+      if (!event.isTrusted) return;
+      var target = event.target;
+      if (!target || target.nodeType !== 1) return;
+
+      var detail = { action: 'change', path: pathOf(target) };
+      if (typeof target.value === 'string') detail.value = target.value;
+      if (typeof target.checked === 'boolean') detail.checked = target.checked;
+
+      sendInteraction(detail);
+    }, true);
+
+    ['keydown', 'keyup'].forEach(function (type) {
+      document.addEventListener(type, function (event) {
+        if (!event.isTrusted) return;
+        var target = event.target;
+        sendInteraction({
+          action: type,
+          path: target && target.nodeType === 1 ? pathOf(target) : '',
+          key: event.key,
+          code: event.code,
+          altKey: event.altKey,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          shiftKey: event.shiftKey
+        });
+      }, true);
+    });
+  }
+
+  if (MODE === 'capture' || MODE === 'replay') {
+    window.addEventListener('message', function (event) {
+      var data = event.data;
+      if (!data || data.source !== 'peerlessons-preview') return;
+      if (data.action !== 'replay' || !data.event) return;
+
+      var detail = data.event;
+      var target = elementAt(detail.path || '');
+      if (!target) return;
+
+      if (detail.action === 'click') {
+        target.click();
+        return;
+      }
+
+      if (detail.action === 'input' || detail.action === 'change') {
+        if (detail.checked !== undefined && 'checked' in target) {
+          target.checked = Boolean(detail.checked);
+        } else if (detail.value !== undefined) {
+          if (target.isContentEditable) {
+            target.textContent = detail.value;
+          } else {
+            target.value = detail.value;
+          }
+        }
+
+        var kind = detail.action === 'input' ? 'input' : 'change';
+        target.dispatchEvent(new Event(kind, { bubbles: true }));
+        return;
+      }
+
+      if (detail.action === 'keydown' || detail.action === 'keyup') {
+        try {
+          target.focus();
+        } catch (error) {
+          /* элемент может быть нефокусируемым */
+        }
+
+        target.dispatchEvent(
+          new KeyboardEvent(detail.action, {
+            key: detail.key,
+            code: detail.code,
+            altKey: Boolean(detail.altKey),
+            ctrlKey: Boolean(detail.ctrlKey),
+            metaKey: Boolean(detail.metaKey),
+            shiftKey: Boolean(detail.shiftKey),
+            bubbles: true,
+            cancelable: true
+          })
+        );
+      }
+    });
+  }
+
+  post({ action: 'ready' });
+})();
+<\/script>`
+}
+
+function resolveFilesReference(reference) {
+  const clean = String(reference || '')
+    .replace(/^\.?\//, '')
+    .split(/[?#]/)[0]
+    .trim()
+
+  if (!clean) return ''
+  if (Object.prototype.hasOwnProperty.call(files.value, clean)) return clean
+
+  const lower = clean.toLowerCase()
+  return (
+    Object.keys(files.value).find(
+      (name) => name.toLowerCase() === lower
+    ) || ''
   )
+}
+
+function getPreviewHtmlFile() {
+  const names = Object.keys(files.value)
+  const has = (name) =>
+    Object.prototype.hasOwnProperty.call(files.value, name)
+
+  // В общем режиме превью должно быть одинаковым у всех, поэтому
+  // ориентируемся на вкладку редактора, а не на личную вкладку клиента.
+  const referenceTab =
+    previewMode.value === 'shared' ? editorTab.value : activeTab.value
+
+  if (
+    referenceTab &&
+    referenceTab.toLowerCase().endsWith('.html') &&
+    has(referenceTab)
+  ) {
+    return referenceTab
+  }
+
+  if (has('index.html')) {
+    return 'index.html'
+  }
+
+  return names.find((name) => name.toLowerCase().endsWith('.html')) || ''
+}
+
+function generatePreviewContent() {
+  const htmlFile = getPreviewHtmlFile()
+
+  if (!htmlFile) {
+    return (
+      '<!DOCTYPE html><html><body style="margin:0;padding:20px;' +
+      'color:#667;font-family:sans-serif">' +
+      'Нет HTML-файлов для предпросмотра.</body></html>'
+    )
+  }
+
+  let html = files.value[htmlFile] || ''
+
+  // Подставляем содержимое CSS-файлов, на которые ссылается HTML.
+  html = html.replace(/<link\b[^>]*>/gi, (tag) => {
+    const href = /\bhref\s*=\s*["']([^"']+)["']/i.exec(tag)
+    if (!href) return tag
+
+    const name = resolveFilesReference(href[1])
+    if (!name || !name.toLowerCase().endsWith('.css')) return tag
+
+    return `<style>\n${files.value[name] || ''}\n</style>`
+  })
+
+  // Подставляем содержимое JS-файлов.
   html = html.replace(
-    /<script\s+src=["']main\.js["']\s*><\/script>/gi,
-    `<script>\n${js}\n<\/script>`
+    /<script\b([^>]*)>\s*<\/script>/gi,
+    (tag, attrs) => {
+      const src = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(attrs)
+      if (!src) return tag
+
+      const name = resolveFilesReference(src[1])
+      if (!name || !name.toLowerCase().endsWith('.js')) return tag
+
+      return `<script>\n${files.value[name] || ''}\n<\/script>`
+    }
   )
-  return html
+
+  const bridge = buildPreviewInteractionScript()
+  if (!bridge) return html
+
+  // Вставляем мост до закрытия body, чтобы браузер точно выполнил его
+  // в документе (а не за пределами </html>).
+  const bodyMatches = [...html.matchAll(/<\/body\s*>/gi)]
+  const lastBody = bodyMatches[bodyMatches.length - 1]
+
+  if (!lastBody) return html + bridge
+
+  return html.slice(0, lastBody.index) + bridge + html.slice(lastBody.index)
 }
 
 // Применяет изменения кода минимальной правкой, не сбрасывая скролл и модель.
@@ -223,8 +572,13 @@ function applyRemoteCode(nextValue) {
 
 function updatePreviewNow(force = false) {
   clearTimeout(previewTimer)
+  previewReady.value = false
   previewHtml.value = generatePreviewContent()
-  if (force) previewKey.value++
+
+  if (force) {
+    pendingPreviewEvents = []
+    previewKey.value++
+  }
 }
 
 function schedulePreviewUpdate() {
@@ -241,6 +595,8 @@ function postPreviewHtml() {
   const frame = previewFrame.value
   if (!frame?.contentWindow) return
 
+  previewReady.value = false
+
   // targetOrigin '*' неизбежен: iframe в sandbox без allow-same-origin имеет
   // непрозрачный origin, и сообщение с origin сайта до него не дойдёт.
   frame.contentWindow.postMessage(
@@ -249,12 +605,62 @@ function postPreviewHtml() {
   )
 }
 
+// События, пришедшие до готовности превью (в т.ч. журнал для поздно
+// подключившихся), применяем сразу после его загрузки.
+function queuePreviewEvent(detail) {
+  if (!detail) return
+
+  if (previewReady.value && previewFrame.value?.contentWindow) {
+    previewFrame.value.contentWindow.postMessage(
+      { type: 'preview-event', event: detail },
+      '*'
+    )
+    return
+  }
+
+  pendingPreviewEvents.push(detail)
+  if (pendingPreviewEvents.length > 300) pendingPreviewEvents.shift()
+}
+
+function flushPreviewEvents() {
+  const frame = previewFrame.value
+  if (!frame?.contentWindow) return
+
+  const events = pendingPreviewEvents
+  pendingPreviewEvents = []
+
+  for (const detail of events) {
+    frame.contentWindow.postMessage({ type: 'preview-event', event: detail }, '*')
+  }
+}
+
 function onPreviewMessage(event) {
+  const data = event.data
+  if (!data) return
+
+  // Сообщения из встроенного превью приходят напрямую в приложение.
+  if (data.source === 'peerlessons-preview') {
+    if (data.action === 'ready') {
+      previewReady.value = true
+      flushPreviewEvents()
+      return
+    }
+
+    if (
+      data.action === 'interaction' &&
+      data.event &&
+      previewMode.value === 'shared' &&
+      isHost.value
+    ) {
+      send({ type: 'preview-interaction', event: data.event })
+    }
+    return
+  }
+
   const frame = previewFrame.value
   if (!frame || event.source !== frame.contentWindow) return
 
-  const data = event.data
-  if (data && data.type === 'preview-ready') {
+  if (data.type === 'preview-ready') {
     postPreviewHtml()
   }
 }
@@ -370,10 +776,44 @@ onMounted(async () => {
       }
     })
 
+    monaco.editor.defineTheme('peerless-light', {
+      base: 'vs',
+      inherit: true,
+      rules: [
+        { token: 'comment', foreground: '7d8697', fontStyle: 'italic' },
+        { token: 'keyword', foreground: 'c44a17' },
+        { token: 'string', foreground: '2f7d4f' },
+        { token: 'number', foreground: '9a6700' },
+        { token: 'tag', foreground: 'c44a17' },
+        { token: 'attribute.name', foreground: '3a4150' },
+        { token: 'attribute.value', foreground: '2f7d4f' }
+      ],
+      colors: {
+        'editor.background': '#ffffff',
+        'editor.foreground': '#1d2027',
+        'editorLineNumber.foreground': '#b3bac6',
+        'editorLineNumber.activeForeground': '#5b6474',
+        'editor.lineHighlightBackground': '#f4f5f8',
+        'editor.selectionBackground': '#de5a2245',
+        'editor.inactiveSelectionBackground': '#de5a2220',
+        'editorCursor.foreground': '#de5a22',
+        'editorIndentGuide.background1': '#e6e9ef',
+        'editorIndentGuide.activeBackground1': '#c8cfda',
+        'editorWidget.background': '#ffffff',
+        'editorWidget.border': '#dfe3ea',
+        'editorSuggestWidget.background': '#ffffff',
+        'editorSuggestWidget.border': '#dfe3ea',
+        'editorSuggestWidget.selectedBackground': '#f0f2f6',
+        'scrollbarSlider.background': '#c8cfda80',
+        'scrollbarSlider.hoverBackground': '#b0b8c6',
+        'scrollbarSlider.activeBackground': '#98a1b3'
+      }
+    })
+
     editor = monaco.editor.create(document.getElementById('editor'), {
         value: files.value[activeTab.value],
         language: getLang(activeTab.value),
-        theme: 'peerless-dark',
+        theme: monacoThemeId(resolvedTheme.value),
         readOnly: true,
         automaticLayout: true,
         minimap: { enabled: false },
@@ -415,6 +855,7 @@ onMounted(async () => {
   document.fonts?.ready.then(() => monaco.editor.remeasureFonts())
 
   decorationsCollection = editor.createDecorationsCollection()
+  refreshAnnotationDecorations()
 
   // Изменения кода
   editor.onDidChangeModelContent(() => {
@@ -429,6 +870,8 @@ onMounted(async () => {
 
   // Курсор / выделение
   editor.onDidChangeCursorSelection((e) => {
+    hasEditorSelection.value = Boolean(e.selection && !e.selection.isEmpty())
+
     if (!canEdit.value || !ws || ws.readyState !== WebSocket.OPEN) return
     const sel = e.selection
     send({
@@ -436,6 +879,21 @@ onMounted(async () => {
       selection: toRemoteSelection(sel),
       color: getUserColor(myUserId.value)
     })
+  })
+
+  // Клик по подсвеченному фрагменту открывает карточку пометки.
+  editor.onMouseUp((event) => {
+    const position = event.target.position
+    if (!position) return
+
+    const selection = editor.getSelection()
+    if (selection && !selection.isEmpty()) return
+
+    const annotation = annotationAt(position)
+    if (annotation) {
+      const mouseEvent = event.event?.browserEvent
+      openAnnotationPopup(annotation, mouseEvent)
+    }
   })
 
   await connectWS()
@@ -446,6 +904,10 @@ onUnmounted(() => {
   wsGeneration += 1
   clearTimeout(reconnectTimer)
   clearTimeout(previewTimer)
+  clearTimeout(annotationMessageTimer)
+  clearTimeout(clearAnnotationsTimer)
+  closeAnnotationPopup()
+  disposeAnnotationDecorations()
 
   stopResize()
   window.removeEventListener('resize', handleWindowResize)
@@ -465,17 +927,19 @@ onUnmounted(() => {
 })
 
 function getLang(name) {
-  if (name.endsWith('.html') || name.endsWith('.vue')) return 'html'
-  if (name.endsWith('.css')) return 'css'
-  if (name.endsWith('.js')) return 'javascript'
-  if (name.endsWith('.py')) return 'python'
+  const lower = String(name || '').toLowerCase()
+  if (lower.endsWith('.html') || lower.endsWith('.vue')) return 'html'
+  if (lower.endsWith('.css')) return 'css'
+  if (lower.endsWith('.js')) return 'javascript'
+  if (lower.endsWith('.py')) return 'python'
   return 'plaintext'
 }
 
 function fileKind(name) {
-  if (name.endsWith('.html') || name.endsWith('.vue')) return 'html'
-  if (name.endsWith('.css')) return 'css'
-  if (name.endsWith('.js')) return 'js'
+  const lower = String(name || '').toLowerCase()
+  if (lower.endsWith('.html') || lower.endsWith('.vue')) return 'html'
+  if (lower.endsWith('.css')) return 'css'
+  if (lower.endsWith('.js')) return 'js'
   return 'other'
 }
 
@@ -500,6 +964,9 @@ function switchTab(name) {
   activeTab.value = name
   ignoreChanges = true
 
+  // Декорации привязаны к модели — сбрасываем их до замены модели.
+  disposeAnnotationDecorations()
+
   const lang = getLang(name)
     const oldModel = editor.getModel()
     const newModel = monaco.editor.createModel(
@@ -511,7 +978,10 @@ function switchTab(name) {
 
   ignoreChanges = false
 
+  hasEditorSelection.value = false
+
   if (canEdit.value) {
+    editorTab.value = name
     send({ type: 'code-update', files: files.value, activeTab: name })
 
     // ← НОВОЕ: сразу отправляем новый курсор на новой вкладке
@@ -525,6 +995,111 @@ function switchTab(name) {
         })
       }
     })
+  }
+
+  updateRemoteDecorations()
+}
+
+// Ручной выбор вкладки: наблюдатель перестаёт следовать за редактором.
+function selectTab(name) {
+  if (name === activeTab.value) return
+
+  if (!canEdit.value && followEditor.value) {
+    followEditor.value = false
+  }
+
+  switchTab(name)
+}
+
+function toggleFollow() {
+  followEditor.value = !followEditor.value
+
+  if (followEditor.value && editorTab.value !== activeTab.value) {
+    switchTab(editorTab.value)
+  }
+}
+
+// Заменяет модель редактора без отправки code-update.
+function loadTabIntoEditor(name) {
+  if (!editor) return
+
+  disposeAnnotationDecorations()
+
+  const oldModel = editor.getModel()
+  ignoreChanges = true
+
+  try {
+    const model = monaco.editor.createModel(
+      files.value[name] || '',
+      getLang(name)
+    )
+    editor.setModel(model)
+  } finally {
+    ignoreChanges = false
+  }
+
+  oldModel?.dispose()
+  hasEditorSelection.value = false
+  updateRemoteDecorations()
+  refreshAnnotationDecorations()
+}
+
+// Применяет изменения состава файлов от сервера (создание/удаление).
+function applyFilesUpdate(nextFiles, serverActiveTab) {
+  if (!nextFiles || typeof nextFiles !== 'object') return
+
+  const names = Object.keys(nextFiles)
+  if (!names.length) return
+
+  const has = (name) => Object.prototype.hasOwnProperty.call(nextFiles, name)
+  const serverTab =
+    typeof serverActiveTab === 'string' && has(serverActiveTab)
+      ? serverActiveTab
+      : ''
+  const fallback =
+    serverTab || (has('index.html') ? 'index.html' : names[0])
+
+  let nextTab = activeTab.value
+  if (!has(nextTab)) {
+    nextTab = fallback
+  } else if ((canEdit.value || followEditor.value) && serverTab) {
+    nextTab = serverTab
+  }
+
+  files.value = { ...nextFiles }
+
+  if (serverTab) editorTab.value = serverTab
+
+  if (!editor) {
+    activeTab.value = nextTab
+  } else if (nextTab !== activeTab.value) {
+    activeTab.value = nextTab
+    loadTabIntoEditor(nextTab)
+  } else if (canEdit.value) {
+    // Не затираем неотправленные правки редактора.
+    files.value[activeTab.value] = editor.getValue()
+  } else {
+    applyRemoteCode(files.value[activeTab.value] || '')
+
+    const model = editor.getModel()
+    const lang = getLang(activeTab.value)
+    if (model && model.getLanguageId() !== lang) {
+      monaco.editor.setModelLanguage(model, lang)
+    }
+  }
+
+  // Пометки удалённых файлов больше некуда привязать.
+  const present = new Set(names)
+  if (annotations.value.some((annotation) => !present.has(annotation.file))) {
+    annotations.value = annotations.value.filter((annotation) =>
+      present.has(annotation.file)
+    )
+  }
+  if (
+    annotationPopup.value &&
+    !present.has(annotationPopup.value.annotation.file)
+  ) {
+    closeAnnotationPopup()
   }
 }
 
@@ -553,8 +1128,39 @@ watch(canEdit, (val) => {
 // Предпросмотр обновляем только после паузы, а не на каждый символ.
 watch(files, schedulePreviewUpdate, { deep: true })
 
+// Смена темы сайта переключает и оформление редактора.
+watch(resolvedTheme, (value) => {
+  if (editor) monaco.editor.setTheme(monacoThemeId(value))
+})
+
 watch(showPreview, (visible) => {
   if (visible) handleWindowResize()
+})
+
+// Пометки относятся к конкретному файлу — при смене вкладки
+// пересобираем декорации с нуля.
+watch(activeTab, () => {
+  closeAnnotationPopup()
+  cancelAnnotation()
+  hasEditorSelection.value = false
+  disposeAnnotationDecorations()
+  refreshAnnotationDecorations()
+  schedulePreviewUpdate()
+})
+
+// В общем режиме переключение вкладки редактора меняет общий предпросмотр.
+watch(editorTab, () => {
+  if (previewMode.value === 'shared') schedulePreviewUpdate()
+})
+
+// Новые и удалённые пометки не должны сбрасывать позиции остальных.
+watch(annotations, () => {
+  refreshAnnotationDecorations()
+})
+
+// Если ведущий ограничил пометки — закрываем незавершённый черновик.
+watch(canAnnotate, (allowed) => {
+  if (!allowed) cancelAnnotation()
 })
 
 async function connectWS() {
@@ -609,9 +1215,24 @@ async function connectWS() {
         if (data.alias) roomAlias.value = data.alias
 
         files.value = data.files || files.value
-        activeTab.value = data.activeTab || activeTab.value
+
+        const nextTab = data.activeTab || activeTab.value
+        const isEditor =
+          Boolean(data.currentEditor) &&
+          data.currentEditor.user_id === myUserId.value
+        editorTab.value = nextTab
+        // Редактор всегда открывает свой файл, наблюдатель — только в режиме слежения.
+        if (isEditor || followEditor.value) {
+          activeTab.value = nextTab
+        }
+
         showPreview.value = !!data.showPreview
+        previewMode.value =
+          data.previewMode === 'shared' ? 'shared' : 'individual'
         if (data.showPreview) updatePreviewNow(true)
+        pendingPreviewEvents = Array.isArray(data.previewEvents)
+          ? [...data.previewEvents]
+          : []
 
         // Кто сейчас редактирует
         currentEditorId.value = data.currentEditor?.user_id ?? null
@@ -639,6 +1260,15 @@ async function connectWS() {
           raisedHands.value = data.raisedHands
         }
 
+        // Пометки на коде и ограничения на их создание
+        annotations.value = Array.isArray(data.annotations)
+          ? data.annotations
+          : []
+        annotationsLocked.value = !!data.annotationsLocked
+        annotationBans.value = Array.isArray(data.bannedAnnotationUserIds)
+          ? data.bannedAnnotationUserIds
+          : []
+
         // Текущие курсоры всех пользователей
         if (data.cursors) {
           remoteSelections.value = {}
@@ -651,7 +1281,6 @@ async function connectWS() {
             }
             ensureRemoteStyle(uid, remoteSelections.value[uid].color)
           }
-          updateRemoteDecorations()
         }
 
         if (editor) {
@@ -670,6 +1299,9 @@ async function connectWS() {
             }
           }
         }
+
+        // Курсоры применяем после установки модели и активной вкладки.
+        updateRemoteDecorations()
       } catch (err) {
         // Ошибка в отрисовке состояния не должна означать «не подключились».
         console.error('Не удалось применить room-state:', err)
@@ -687,7 +1319,16 @@ async function connectWS() {
     // Обычное обновление кода
     if (data.type === 'code-update') {
       files.value = data.files || files.value
-      activeTab.value = data.activeTab || activeTab.value
+
+      const prevActiveTab = activeTab.value
+      const prevEditorTab = editorTab.value
+      const nextTab = data.activeTab || editorTab.value
+      editorTab.value = nextTab
+
+      // Наблюдатель переключается за редактором только в режиме слежения.
+      if (!canEdit.value && followEditor.value) {
+        activeTab.value = nextTab
+      }
 
       if (editor) {
         const newVal = files.value[activeTab.value] || ''
@@ -698,6 +1339,14 @@ async function connectWS() {
         if (model && model.getLanguageId() !== lang) {
           monaco.editor.setModelLanguage(model, lang)
         }
+      }
+
+      if (editorTab.value !== prevEditorTab) {
+        // Редактор ушёл в другой файл — старые каретки к нему уже не относятся.
+        remoteSelections.value = {}
+        clearRemoteDecorations()
+      } else if (activeTab.value !== prevActiveTab) {
+        updateRemoteDecorations()
       }
     }
 
@@ -734,11 +1383,50 @@ async function connectWS() {
     // ← ИЗМЕНЕНО: предпросмотр синхронизируется у всех
     if (data.type === 'preview-toggle') {
       showPreview.value = data.show
-      if (data.show) updatePreviewNow(true)
+      if (data.show) {
+        updatePreviewNow(true)
+        pendingPreviewEvents = Array.isArray(data.events)
+          ? [...data.events]
+          : []
+      }
     }
 
     if (data.type === 'preview-refresh') {
+      pendingPreviewEvents = []
       updatePreviewNow(true)
+    }
+
+    if (data.type === 'preview-mode') {
+      previewMode.value = data.mode === 'shared' ? 'shared' : 'individual'
+      if (showPreview.value) updatePreviewNow(true)
+    }
+
+    if (data.type === 'preview-interaction' && data.event) {
+      if (previewMode.value === 'shared' && !isHost.value) {
+        queuePreviewEvent(data.event)
+      }
+    }
+
+    if (data.type === 'files-update') {
+      applyFilesUpdate(data.files, data.activeTab)
+      if (fileDialog.value) closeFileDialog()
+
+      if (pendingCreatedFile) {
+        const created = pendingCreatedFile
+        pendingCreatedFile = ''
+
+        if (data.files && data.files[created]) {
+          selectTab(created)
+        }
+      }
+    }
+
+    if (data.type === 'file-error') {
+      pendingCreatedFile = ''
+      if (fileDialog.value) {
+        fileDialogError.value = data.reason || 'Не удалось изменить файлы.'
+        fileDialogBusy.value = false
+      }
     }
 
     // Курсор другого пользователя
@@ -763,7 +1451,64 @@ async function connectWS() {
     if (data.type === 'user-left') {
       delete remoteSelections.value[data.user_id]
       raisedHands.value = raisedHands.value.filter(h => h.user_id !== data.user_id)
+      if (participantMenu.value?.participant.user_id === data.user_id) {
+        closeParticipantMenu()
+      }
       updateRemoteDecorations()
+    }
+
+    // ===== Пометки на коде =====
+    if (data.type === 'annotation-added' && data.annotation) {
+      const index = annotations.value.findIndex(
+        (annotation) => annotation.id === data.annotation.id
+      )
+
+      if (index === -1) {
+        annotations.value = [...annotations.value, data.annotation]
+      } else {
+        annotations.value = annotations.value.map((annotation) =>
+          annotation.id === data.annotation.id ? data.annotation : annotation
+        )
+      }
+    }
+
+    if (data.type === 'annotation-removed') {
+      annotations.value = annotations.value.filter(
+        (annotation) => annotation.id !== data.id
+      )
+      if (annotationPopup.value?.annotation.id === data.id) {
+        closeAnnotationPopup()
+      }
+    }
+
+    if (data.type === 'annotations-cleared') {
+      annotations.value = []
+      closeAnnotationPopup()
+    }
+
+    if (data.type === 'annotation-ban') {
+      const bans = new Set(annotationBans.value)
+      if (data.banned) bans.add(data.user_id)
+      else bans.delete(data.user_id)
+      annotationBans.value = [...bans]
+    }
+
+    if (data.type === 'annotation-lock') {
+      annotationsLocked.value = !!data.locked
+    }
+
+    if (data.type === 'annotation-denied') {
+      showAnnotationMessage(data.reason || 'Не удалось оставить пометку.')
+    }
+
+    if (data.type === 'kicked') {
+      // Ведущий исключил нас: реконнект не нужен, показываем причину.
+      shouldReconnect = false
+      connectError.value = data.reason || 'Вас исключили из комнаты.'
+      connectionStatus.value = 'error'
+      ws?.close()
+      ws = null
+      return
     }
 
     if (data.type === 'error') {
@@ -794,10 +1539,12 @@ async function connectWS() {
   }
 }
 
+// 4003 — пользователя исключил ведущий (RoomSession._handle_kick_user),
 // 4401/4403/4404 отдаёт сервер (RoomSession._reject), 1008 — старый вариант.
-const PERMANENT_CLOSE_CODES = new Set([4401, 4403, 4404, 1008])
+const PERMANENT_CLOSE_CODES = new Set([4003, 4401, 4403, 4404, 1008])
 
 function describeClose(event) {
+  if (event.code === 4003) return 'Ведущий исключил вас из комнаты.'
   if (event.code === 4401) return 'Не удалось подтвердить сессию. Войдите заново.'
   if (event.code === 4403) return 'Подключение с этого адреса запрещено сервером.'
   if (event.code === 4404) return 'Комната не найдена или удалена.'
@@ -921,8 +1668,20 @@ function removeRemoteCaret(uid) {
   remoteCaretWidgets.delete(uid)
 }
 
+function clearRemoteDecorations() {
+  decorationsCollection?.set([])
+  for (const uid of [...remoteCaretWidgets.keys()]) removeRemoteCaret(uid)
+}
+
 function updateRemoteDecorations() {
   if (!editor || !decorationsCollection) return
+
+  // Курсор относится к конкретному файлу. Если открыт другой файл,
+  // показывать чужие каретки и выделения нельзя — они будут не на месте.
+  if (editorTab.value !== activeTab.value) {
+    clearRemoteDecorations()
+    return
+  }
 
   const newDecorations = []
   const withCursor = new Set()
@@ -969,6 +1728,169 @@ function updateRemoteDecorations() {
   }
 
   decorationsCollection.set(newDecorations)
+}
+
+// ===== Пометки на коде =====
+
+function ensureAnnotationStyle(userId, color) {
+  const id = `annotation-style-${userId}`
+  if (document.getElementById(id)) return
+  const style = document.createElement('style')
+  style.id = id
+  style.textContent = `
+    .annotation-mark-${userId} {
+      background-color: ${color}26 !important;
+      border-bottom: 2px solid ${color} !important;
+    }
+  `
+  document.head.appendChild(style)
+}
+
+function buildAnnotationDecoration(annotation) {
+  const color = getUserColor(annotation.user_id)
+  ensureAnnotationStyle(annotation.user_id, color)
+
+  const selection = annotationRange(annotation)
+  return {
+    range: new monaco.Range(
+      selection.startLineNumber,
+      selection.startColumn,
+      selection.endLineNumber,
+      selection.endColumn
+    ),
+    options: {
+      inlineClassName: `annotation-mark-${annotation.user_id}`,
+      hoverMessage: {
+        value: `**${annotation.username}**\n\n${annotation.text}`
+      },
+      stickiness:
+        monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
+    }
+  }
+}
+
+// Актуальный диапазон пометки: Monaco сдвигает декорации при правках,
+// поэтому координаты, сохранённые при создании, могут устареть.
+function annotationRange(annotation) {
+  return annotationRanges.get(annotation.id) || annotation.selection
+}
+
+function rememberAnnotationRange(id) {
+  const handle = annotationDecorationHandles.get(id)
+  const range = handle?.getRange(0)
+  if (!range) return
+
+  annotationRanges.set(id, {
+    startLineNumber: range.startLineNumber,
+    startColumn: range.startColumn,
+    endLineNumber: range.endLineNumber,
+    endColumn: range.endColumn
+  })
+}
+
+// Каждая пометка живёт в своей коллекции декораций: так Monaco сам
+// сдвигает её при редактировании и новые пометки не сбрасывают старые.
+function refreshAnnotationDecorations() {
+  if (!editor) return
+
+  const knownIds = new Set(annotations.value.map((annotation) => annotation.id))
+  for (const id of annotationRanges.keys()) {
+    if (!knownIds.has(id)) annotationRanges.delete(id)
+  }
+
+  const visible = annotations.value.filter(
+    (annotation) => annotation.file === activeTab.value
+  )
+  const visibleIds = new Set(visible.map((annotation) => annotation.id))
+
+  for (const [id, handle] of annotationDecorationHandles) {
+    if (visibleIds.has(id)) continue
+    rememberAnnotationRange(id)
+    handle.clear()
+    annotationDecorationHandles.delete(id)
+  }
+
+  for (const annotation of visible) {
+    if (annotationDecorationHandles.has(annotation.id)) continue
+
+    const handle = editor.createDecorationsCollection([
+      buildAnnotationDecoration(annotation)
+    ])
+    annotationDecorationHandles.set(annotation.id, handle)
+  }
+}
+
+function disposeAnnotationDecorations() {
+  for (const [id, handle] of annotationDecorationHandles) {
+    rememberAnnotationRange(id)
+    handle.clear()
+  }
+  annotationDecorationHandles.clear()
+}
+
+function selectionSize(selection) {
+  return (
+    (selection.endLineNumber - selection.startLineNumber) * 1000 +
+    (selection.endColumn - selection.startColumn)
+  )
+}
+
+function annotationAt(position) {
+  let match = null
+  let matchSize = Infinity
+
+  // Ориентируемся на текущее положение декораций: при правках кода
+  // Monaco сдвигает их, а сохранённые в пометке координаты уже старые.
+  for (const [id, handle] of annotationDecorationHandles) {
+    const range = handle.getRange(0)
+    if (!range || !range.containsPosition(position)) continue
+
+    const annotation = annotations.value.find((item) => item.id === id)
+    if (!annotation) continue
+
+    const size = selectionSize({
+      startLineNumber: range.startLineNumber,
+      startColumn: range.startColumn,
+      endLineNumber: range.endLineNumber,
+      endColumn: range.endColumn
+    })
+
+    if (size < matchSize) {
+      match = annotation
+      matchSize = size
+    }
+  }
+
+  return match
+}
+
+function openAnnotationPopup(annotation, mouseEvent) {
+  const x = mouseEvent?.clientX ?? window.innerWidth / 2
+  const y = mouseEvent?.clientY ?? window.innerHeight / 2
+
+  const left = Math.max(
+    8,
+    Math.min(x, window.innerWidth - ANNOTATION_POPUP_WIDTH - 8)
+  )
+  const below = y + 14
+  const top =
+    below + ANNOTATION_POPUP_HEIGHT <= window.innerHeight - 8
+      ? below
+      : Math.max(8, y - ANNOTATION_POPUP_HEIGHT - 14)
+
+  const range = annotationDecorationHandles.get(annotation.id)?.getRange(0)
+
+  annotationPopup.value = {
+    annotation,
+    top,
+    left,
+    lineStart: range?.startLineNumber,
+    lineEnd: range?.endLineNumber
+  }
+}
+
+function closeAnnotationPopup() {
+  annotationPopup.value = null
 }
 
 // ===== Resizer =====
@@ -1053,14 +1975,27 @@ function handleWindowResize() {
 
 // ===== Действия =====
 function togglePreview() {
-  showPreview.value = !showPreview.value
-  if (showPreview.value) updatePreviewNow(true)
-  send({ type: 'preview-toggle', show: showPreview.value })
+  // Видимость результата синхронизируется сервером для всех участников.
+  send({ type: 'preview-toggle', show: !showPreview.value })
 }
 
 function refreshPreview() {
+  if (!canRefreshPreview.value) return
+
   updatePreviewNow(true)
-  send({ type: 'preview-refresh' })
+
+  if (previewMode.value === 'shared') {
+    send({ type: 'preview-refresh' })
+  }
+}
+
+function togglePreviewMode() {
+  if (!isHost.value) return
+
+  send({
+    type: 'preview-mode',
+    mode: previewMode.value === 'shared' ? 'individual' : 'shared'
+  })
 }
 
 function raiseHand() {
@@ -1079,6 +2014,275 @@ function grantEdit(userId) {
 
 function revokeEdit() {
   send({ type: 'revoke-edit', user_id: myUserId.value })
+}
+
+// ===== Меню действий ведущего =====
+const participantMenu = ref(null)
+
+const PARTICIPANT_MENU_WIDTH = 220
+const PARTICIPANT_MENU_HEIGHT = 150
+
+function openParticipantMenu(event, participant) {
+  if (
+    participantMenu.value?.participant.user_id === participant.user_id
+  ) {
+    closeParticipantMenu()
+    return
+  }
+
+  const rect = event.currentTarget.getBoundingClientRect()
+  const left = Math.max(
+    8,
+    Math.min(
+      rect.right - PARTICIPANT_MENU_WIDTH,
+      window.innerWidth - PARTICIPANT_MENU_WIDTH - 8
+    )
+  )
+  const below = rect.bottom + 6
+  const top =
+    below + PARTICIPANT_MENU_HEIGHT <= window.innerHeight - 8
+      ? below
+      : Math.max(8, rect.top - PARTICIPANT_MENU_HEIGHT - 6)
+
+  participantMenu.value = { participant, top, left }
+}
+
+function closeParticipantMenu() {
+  participantMenu.value = null
+}
+
+function grantEditFromMenu() {
+  const participant = participantMenu.value?.participant
+  closeParticipantMenu()
+  if (participant) grantEdit(participant.user_id)
+}
+
+function revokeEditFromMenu() {
+  closeParticipantMenu()
+  revokeEdit()
+}
+
+function kickUserFromMenu() {
+  const participant = participantMenu.value?.participant
+  closeParticipantMenu()
+
+  if (!participant || !isHost.value) return
+  if (participant.user_id === myUserId.value) return
+
+  send({ type: 'kick-user', user_id: participant.user_id })
+}
+
+// ===== Создание и удаление файлов =====
+
+function openFileDialogAt(event, dialog) {
+  const rect = event.currentTarget.getBoundingClientRect()
+  const width = 260
+  const height = dialog.mode === 'create' ? 220 : 170
+
+  const left = Math.max(
+    8,
+    Math.min(rect.left, window.innerWidth - width - 8)
+  )
+  const below = rect.bottom + 6
+  const top =
+    below + height <= window.innerHeight - 8
+      ? below
+      : Math.max(8, rect.top - height - 6)
+
+  fileDialog.value = { ...dialog, top, left }
+  fileDialogError.value = ''
+  fileDialogBusy.value = false
+}
+
+function openCreateFileDialog(event) {
+  if (!isHost.value) return
+  if (filesCount.value >= MAX_ROOM_FILES) return
+
+  openFileDialogAt(event, { mode: 'create', fileName: '' })
+}
+
+function openDeleteFileDialog(event, name) {
+  if (!isHost.value) return
+  if (filesCount.value <= 1) return
+
+  openFileDialogAt(event, { mode: 'delete', fileName: name })
+}
+
+function closeFileDialog() {
+  fileDialog.value = null
+  fileDialogError.value = ''
+  fileDialogBusy.value = false
+}
+
+function validateNewFileName(name) {
+  if (!name) return 'Введите имя файла'
+  if (name.length > 64) return 'Слишком длинное имя файла'
+  if (!FILE_NAME_RE.test(name)) {
+    return 'Только латиница, цифры, точка, дефис и подчёркивание; расширение .html, .css или .js'
+  }
+  if (filesCount.value >= MAX_ROOM_FILES) return 'Достигнут лимит файлов'
+
+  const lower = name.toLowerCase()
+  if (Object.keys(files.value).some((file) => file.toLowerCase() === lower)) {
+    return 'Файл с таким именем уже существует'
+  }
+
+  return ''
+}
+
+function submitFileDialog(value) {
+  const dialog = fileDialog.value
+  if (!dialog || fileDialogBusy.value) return
+
+  if (dialog.mode === 'delete') {
+    fileDialogBusy.value = true
+    send({ type: 'file-delete', name: dialog.fileName })
+    return
+  }
+
+  const name = String(value || '').trim()
+  const error = validateNewFileName(name)
+
+  if (error) {
+    fileDialogError.value = error
+    return
+  }
+
+  fileDialogBusy.value = true
+  pendingCreatedFile = name
+  send({ type: 'file-create', name })
+}
+
+// ===== Создание и модерация пометок =====
+
+function showAnnotationMessage(message) {
+  annotationMessage.value = message
+  clearTimeout(annotationMessageTimer)
+  annotationMessageTimer = setTimeout(() => {
+    annotationMessage.value = ''
+  }, 4000)
+}
+
+function startAnnotation() {
+  if (!editor || !canAnnotate.value) return
+
+  const model = editor.getModel()
+  const selection = editor.getSelection()
+
+  if (!model || !selection || selection.isEmpty()) {
+    showAnnotationMessage('Сначала выделите фрагмент кода.')
+    return
+  }
+
+  annotationDraft.value = {
+    file: activeTab.value,
+    selection: {
+      startLineNumber: selection.startLineNumber,
+      startColumn: selection.startColumn,
+      endLineNumber: selection.endLineNumber,
+      endColumn: selection.endColumn
+    },
+    excerpt: model.getValueInRange(selection).slice(0, 200)
+  }
+  annotationText.value = ''
+
+  nextTick(() => annotationInput.value?.focus())
+}
+
+function cancelAnnotation() {
+  annotationDraft.value = null
+  annotationText.value = ''
+}
+
+function submitAnnotation() {
+  const draft = annotationDraft.value
+  const text = annotationText.value.trim()
+
+  if (!draft || !text || !canAnnotate.value) return
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showAnnotationMessage('Нет соединения с комнатой. Попробуйте ещё раз.')
+    return
+  }
+
+  send({
+    type: 'annotation-add',
+    file: draft.file,
+    selection: draft.selection,
+    text
+  })
+
+  annotationDraft.value = null
+  annotationText.value = ''
+}
+
+function revealAnnotation(annotation) {
+  if (annotation.file !== activeTab.value) {
+    selectTab(annotation.file)
+  }
+
+  nextTick(() => {
+    if (!editor) return
+
+    const selection = annotationRange(annotation)
+    const range = new monaco.Range(
+      selection.startLineNumber,
+      selection.startColumn,
+      selection.endLineNumber,
+      selection.endColumn
+    )
+
+    editor.revealRangeInCenter(range)
+    editor.setSelection(range)
+    editor.focus()
+  })
+}
+
+function removeAnnotation(id) {
+  if (!isHost.value || !id) return
+  send({ type: 'annotation-remove', id })
+}
+
+function removeAnnotationFromPopup() {
+  const annotation = annotationPopup.value?.annotation
+  closeAnnotationPopup()
+  if (annotation) removeAnnotation(annotation.id)
+}
+
+function clearAllAnnotations() {
+  if (!isHost.value || !annotations.value.length) return
+
+  if (!clearAnnotationsConfirm.value) {
+    clearAnnotationsConfirm.value = true
+    clearTimeout(clearAnnotationsTimer)
+    clearAnnotationsTimer = setTimeout(() => {
+      clearAnnotationsConfirm.value = false
+    }, 4000)
+    return
+  }
+
+  clearAnnotationsConfirm.value = false
+  clearTimeout(clearAnnotationsTimer)
+  send({ type: 'annotation-clear' })
+}
+
+function toggleAnnotationsLock() {
+  if (!isHost.value) return
+  send({ type: 'annotation-lock', locked: !annotationsLocked.value })
+}
+
+function toggleAnnotationBanFromMenu() {
+  const participant = participantMenu.value?.participant
+  closeParticipantMenu()
+
+  if (!participant || !isHost.value) return
+  if (participant.user_id === myUserId.value) return
+
+  send({
+    type: 'annotation-ban',
+    user_id: participant.user_id,
+    banned: !annotationBans.value.includes(participant.user_id)
+  })
 }
 </script>
 
@@ -1121,24 +2325,97 @@ function revokeEdit() {
     <div class="workspace">
       <section class="editor-panel">
         <div class="editor-toolbar">
-          <div class="tabs">
+          <div class="tabs-wrap">
+            <div class="tabs">
+              <div
+                v-for="(_, name) in files"
+                :key="name"
+                class="tab-group"
+              >
+                <button
+                  type="button"
+                  :class="['tab', { active: name === activeTab }]"
+                  @click="selectTab(name)"
+                >
+                  <span class="tab-dot" :class="fileKind(name)"></span>
+                  {{ name }}
+                </button>
+                <button
+                  v-if="isHost && name === activeTab && filesCount > 1"
+                  type="button"
+                  class="tab-remove"
+                  data-file-dialog-trigger
+                  :aria-label="`Удалить файл ${name}`"
+                  title="Удалить файл"
+                  @click.stop="openDeleteFileDialog($event, name)"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+
             <button
-              v-for="(_, name) in files"
-              :key="name"
-              :class="['tab', { active: name === activeTab }]"
-              @click="switchTab(name)"
+              v-if="isHost"
+              type="button"
+              class="tab-add"
+              data-file-dialog-trigger
+              title="Создать файл"
+              :disabled="filesCount >= MAX_ROOM_FILES"
+              @click="openCreateFileDialog"
             >
-              <span class="tab-dot" :class="fileKind(name)"></span>
-              {{ name }}
+              +
             </button>
           </div>
 
           <div class="toolbar-actions">
-            <button v-if="canEdit" class="btn btn-secondary btn-sm" @click="togglePreview">
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm annotate-btn"
+              :disabled="!canAnnotate || !hasEditorSelection"
+              :title="annotateTitle"
+              @click="startAnnotation"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="15"
+                height="15"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+              </svg>
+              Пометка
+            </button>
+            <button
+              v-if="!canEdit"
+              type="button"
+              class="btn btn-ghost btn-sm follow-toggle"
+              :class="{ 'is-on': followEditor }"
+              :aria-pressed="followEditor"
+              :title="
+                followEditor
+                  ? 'Вкладки автоматически переключаются за редактором'
+                  : 'Вы переключаете вкладки самостоятельно'
+              "
+              @click="toggleFollow"
+            >
+              <span class="follow-switch" aria-hidden="true"></span>
+              Слежение
+            </button>
+            <button
+              v-if="canEdit || isHost"
+              class="btn btn-secondary btn-sm"
+              @click="togglePreview"
+            >
               {{ showPreview ? 'Скрыть результат' : 'Запустить код' }}
             </button>
             <button
-              v-if="showPreview"
+              v-if="showPreview && canRefreshPreview"
               class="btn btn-ghost btn-sm"
               @click="refreshPreview"
               title="Обновить предпросмотр"
@@ -1155,8 +2432,40 @@ function revokeEdit() {
 
           <div v-if="showPreview" class="preview-container" :style="{ width: previewWidth + 'px' }">
             <div class="preview-header">
-              <span class="preview-title"><span class="preview-dot"></span> Результат</span>
-              <button v-if="canEdit" class="icon-btn" @click="togglePreview" title="Закрыть">×</button>
+              <span class="preview-title">
+                <span class="preview-dot"></span>
+                Результат
+                <span
+                  v-if="previewMode === 'shared'"
+                  class="preview-mode-tag"
+                >
+                  {{ isHost ? 'общий' : 'показ ведущего' }}
+                </span>
+              </span>
+              <div class="preview-header-actions">
+                <button
+                  v-if="isHost"
+                  type="button"
+                  class="preview-mode-btn"
+                  :class="{ 'is-on': previewMode === 'shared' }"
+                  :title="
+                    previewMode === 'shared'
+                      ? 'Все видят действия ведущего. Переключить на отдельный результат'
+                      : 'У каждого свой результат. Переключить на общий показ'
+                  "
+                  @click="togglePreviewMode"
+                >
+                  {{ previewMode === 'shared' ? 'Общий' : 'Личный' }}
+                </button>
+                <button
+                  v-if="canEdit || isHost"
+                  class="icon-btn"
+                  @click="togglePreview"
+                  title="Закрыть"
+                >
+                  ×
+                </button>
+              </div>
             </div>
             <!-- allow-same-origin намеренно не включён: пользовательский код
                  не должен получать доступ к localStorage и DOM родителя. -->
@@ -1166,7 +2475,14 @@ function revokeEdit() {
               :src="previewShellUrl"
               sandbox="allow-scripts allow-modals allow-forms"
               referrerpolicy="no-referrer"
-              class="preview-frame"
+              :class="[
+                'preview-frame',
+                {
+                  'preview-frame--readonly':
+                    previewMode === 'shared' && !isHost
+                }
+              ]"
+              :tabindex="previewMode === 'shared' && !isHost ? -1 : 0"
               title="Code Preview"
               @load="postPreviewHtml"
             ></iframe>
@@ -1181,7 +2497,11 @@ function revokeEdit() {
             <span class="count">{{ participants.length }}</span>
           </h3>
           <ul class="participant-list">
-            <li v-for="p in participants" :key="p.user_id" class="participant">
+            <li
+              v-for="p in sortedParticipants"
+              :key="p.user_id"
+              class="participant"
+            >
               <span
                 class="avatar"
                 :style="{ color: getUserColor(p.user_id), background: getUserColor(p.user_id) + '1f' }"
@@ -1192,32 +2512,179 @@ function revokeEdit() {
                 {{ p.username }}<span v-if="p.user_id === myUserId" class="you">вы</span>
               </span>
               <span
+                v-if="raisedHandOrder.has(p.user_id)"
+                class="participant-hand"
+                title="Поднял руку"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  width="14"
+                  height="14"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M8 13V4.5a1.5 1.5 0 0 1 3 0V12" />
+                  <path d="M11 11.5v-8a1.5 1.5 0 0 1 3 0V12" />
+                  <path d="M14 11.5v-6a1.5 1.5 0 0 1 3 0V12" />
+                  <path
+                    d="M17 11.5a1.5 1.5 0 0 1 3 0V15a6 6 0 0 1-6 6h-1.5a6.5 6.5 0 0 1-5.2-2.6L4 14.5a1.6 1.6 0 0 1 2.5-2L9 15"
+                  />
+                </svg>
+              </span>
+              <span
                 v-if="p.user_id === currentEditorId"
                 class="editing-dot"
                 title="Редактирует сейчас"
               ></span>
               <span v-if="p.user_id === hostId" class="tag">хост</span>
+              <button
+                v-if="isHost && p.user_id !== myUserId"
+                type="button"
+                class="participant-more"
+                data-participant-menu-trigger
+                :aria-label="`Действия участника ${p.username}`"
+                aria-haspopup="menu"
+                :aria-expanded="
+                  participantMenu?.participant.user_id === p.user_id
+                "
+                @click.stop="openParticipantMenu($event, p)"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="currentColor"
+                  aria-hidden="true"
+                >
+                  <circle cx="5" cy="12" r="1.7" />
+                  <circle cx="12" cy="12" r="1.7" />
+                  <circle cx="19" cy="12" r="1.7" />
+                </svg>
+              </button>
             </li>
           </ul>
         </section>
 
-        <section v-if="raisedHands.length" class="side-card">
+        <section class="side-card">
           <h3 class="side-title">
-            Подняли руку
-            <span class="count">{{ raisedHands.length }}</span>
+            Пометки
+            <span class="count">{{ annotations.length }}</span>
           </h3>
-          <div class="hand-list">
-            <div v-for="h in raisedHands" :key="h.user_id" class="hand-item">
-              <span class="hand-name">{{ h.username }}</span>
+
+          <div v-if="isHost" class="annotation-moderation">
+            <button
+              type="button"
+              class="btn btn-ghost btn-xs"
+              :class="{ 'is-on': annotationsLocked }"
+              :title="
+                annotationsLocked
+                  ? 'Создавать пометки может только ведущий'
+                  : 'Создавать пометки могут все участники'
+              "
+              @click="toggleAnnotationsLock"
+            >
+              {{ annotationsLocked ? 'Только хост' : 'Могут все' }}
+            </button>
+            <button
+              v-if="annotations.length"
+              type="button"
+              class="btn btn-ghost btn-xs annotation-clear-btn"
+              :class="{ 'is-confirming': clearAnnotationsConfirm }"
+              @click="clearAllAnnotations"
+            >
+              {{ clearAnnotationsConfirm ? 'Точно очистить?' : 'Очистить все' }}
+            </button>
+          </div>
+
+          <p v-if="annotationMessage" class="field-error annotation-message">
+            {{ annotationMessage }}
+          </p>
+
+          <form
+            v-if="annotationDraft"
+            class="annotation-compose"
+            @submit.prevent="submitAnnotation"
+          >
+            <p class="annotation-compose-excerpt">
+              {{ annotationDraft.excerpt || '…' }}
+            </p>
+            <div class="field">
+              <label class="label" for="annotation-text">
+                Вопрос или описание
+              </label>
+              <textarea
+                id="annotation-text"
+                ref="annotationInput"
+                v-model="annotationText"
+                class="input annotation-textarea"
+                rows="3"
+                maxlength="600"
+                placeholder="Что нужно объяснить в этом фрагменте?"
+                @keydown.esc.prevent="cancelAnnotation"
+                @keydown.ctrl.enter.prevent="submitAnnotation"
+                @keydown.meta.enter.prevent="submitAnnotation"
+              ></textarea>
+            </div>
+            <div class="annotation-compose-actions">
               <button
-                v-if="isHost"
-                @click="grantEdit(h.user_id)"
+                type="submit"
                 class="btn btn-primary btn-xs"
+                :disabled="!annotationText.trim()"
               >
-                Дать права
+                Оставить
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost btn-xs"
+                @click="cancelAnnotation"
+              >
+                Отмена
               </button>
             </div>
-          </div>
+          </form>
+
+          <p v-else-if="!annotations.length" class="side-empty">
+            {{
+              canAnnotate
+                ? 'Выделите код и нажмите «Пометка», чтобы задать вопрос.'
+                : 'Создание пометок ограничено ведущим.'
+            }}
+          </p>
+
+          <ul v-if="annotations.length" class="annotation-list">
+            <li v-for="a in annotations" :key="a.id" class="annotation-row">
+              <button
+                type="button"
+                class="annotation-row-main"
+                @click="revealAnnotation(a)"
+              >
+                <span class="annotation-row-meta">
+                  <span
+                    class="annotation-author"
+                    :style="{ color: getUserColor(a.user_id) }"
+                  >
+                    {{ a.username }}
+                  </span>
+                  <span class="annotation-file">{{ a.file }}</span>
+                </span>
+                <span class="annotation-row-text">{{ a.text }}</span>
+              </button>
+              <button
+                v-if="isHost"
+                type="button"
+                class="annotation-row-delete"
+                title="Удалить пометку"
+                aria-label="Удалить пометку"
+                @click="removeAnnotation(a.id)"
+              >
+                ×
+              </button>
+            </li>
+          </ul>
         </section>
 
         <div class="side-actions">
@@ -1230,6 +2697,46 @@ function revokeEdit() {
     </div>
 
     <div v-if="isResizing" class="resize-shield" aria-hidden="true"></div>
+
+    <ParticipantMenu
+      v-if="participantMenu"
+      :participant="participantMenu.participant"
+      :is-current-editor="
+        participantMenu.participant.user_id === currentEditorId
+      "
+      :position="{ top: participantMenu.top, left: participantMenu.left }"
+      :annotations-banned="
+        annotationBans.includes(participantMenu.participant.user_id)
+      "
+      @grant="grantEditFromMenu"
+      @revoke="revokeEditFromMenu"
+      @kick="kickUserFromMenu"
+      @toggle-ban="toggleAnnotationBanFromMenu"
+      @close="closeParticipantMenu"
+    />
+
+    <FileActionDialog
+      v-if="fileDialog"
+      :mode="fileDialog.mode"
+      :file-name="fileDialog.fileName"
+      :error="fileDialogError"
+      :busy="fileDialogBusy"
+      :position="{ top: fileDialog.top, left: fileDialog.left }"
+      @submit="submitFileDialog"
+      @close="closeFileDialog"
+    />
+
+    <AnnotationPopup
+      v-if="annotationPopup"
+      :annotation="annotationPopup.annotation"
+      :color="getUserColor(annotationPopup.annotation.user_id)"
+      :is-host="isHost"
+      :line-start="annotationPopup.lineStart"
+      :line-end="annotationPopup.lineEnd"
+      :position="{ top: annotationPopup.top, left: annotationPopup.left }"
+      @close="closeAnnotationPopup"
+      @remove="removeAnnotationFromPopup"
+    />
 
     <div
       v-if="connectionStatus !== 'online'"
@@ -1375,7 +2882,7 @@ function revokeEdit() {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  background: #0f1219;
+  background: var(--editor-bg);
 }
 
 .editor-toolbar {
@@ -1389,6 +2896,14 @@ function revokeEdit() {
   border-bottom: 1px solid var(--border);
 }
 
+.tabs-wrap {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .tabs {
   display: flex;
   flex: 1;
@@ -1400,6 +2915,64 @@ function revokeEdit() {
 
 .tabs::-webkit-scrollbar {
   display: none;
+}
+
+.tab-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.tab-remove {
+  flex: none;
+  width: 20px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.16s ease, color 0.16s ease;
+}
+
+.tab-remove:hover {
+  background: var(--danger-soft);
+  color: var(--danger-text-hover);
+}
+
+.tab-add {
+  flex: none;
+  width: 28px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px dashed var(--border-strong);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease,
+    background-color 0.16s ease;
+}
+
+.tab-add:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tab-add:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .tab {
@@ -1454,6 +3027,52 @@ function revokeEdit() {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+.follow-toggle {
+  flex: none;
+  gap: 9px;
+}
+
+.follow-switch {
+  position: relative;
+  width: 26px;
+  height: 15px;
+  flex: none;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-3);
+  transition: background-color 0.16s ease, border-color 0.16s ease;
+}
+
+.follow-switch::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transform: translateY(-50%);
+  transition: transform 0.16s ease, background-color 0.16s ease;
+}
+
+.btn.follow-toggle.is-on,
+.btn.follow-toggle.is-on:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.btn.follow-toggle.is-on .follow-switch {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn.follow-toggle.is-on .follow-switch::after {
+  background: #fff;
+  transform: translate(11px, -50%);
 }
 
 .editor-area {
@@ -1512,6 +3131,50 @@ function revokeEdit() {
   font-weight: 600;
 }
 
+.preview-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.preview-mode-tag {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: #e7ebf2;
+  color: #5a6373;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.preview-mode-btn {
+  padding: 3px 8px;
+  border: 1px solid #d7dbe3;
+  border-radius: 6px;
+  background: transparent;
+  color: #4a5160;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.16s ease, border-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.preview-mode-btn:hover {
+  background: #e7e9ee;
+  border-color: #c3c8d2;
+  color: #191c23;
+}
+
+.preview-mode-btn.is-on {
+  background: #e3edff;
+  border-color: #b9ccf0;
+  color: #2b57a8;
+}
+
 .preview-dot {
   width: 7px;
   height: 7px;
@@ -1546,6 +3209,11 @@ function revokeEdit() {
   height: 100%;
   border: 0;
   background: #fff;
+}
+
+/* В общем режиме наблюдатели не могут взаимодействовать с чужим превью. */
+.preview-frame--readonly {
+  pointer-events: none;
 }
 
 .sidebar {
@@ -1637,6 +3305,41 @@ function revokeEdit() {
   text-overflow: ellipsis;
 }
 
+.participant-hand {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.participant-more {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background-color 0.16s ease, border-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.participant-more:hover,
+.participant-more[aria-expanded='true'] {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+
 .editing-dot {
   width: 6px;
   height: 6px;
@@ -1654,7 +3357,7 @@ function revokeEdit() {
 
 .tag {
   padding: 2px 6px;
-  border: 1px solid rgba(255, 122, 69, 0.3);
+  border: 1px solid var(--accent-border);
   border-radius: 5px;
   background: var(--accent-soft);
   color: var(--accent);
@@ -1662,26 +3365,6 @@ function revokeEdit() {
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-}
-
-.hand-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.hand-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 13.5px;
-}
-
-.hand-name {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
 }
 
 .side-actions {
@@ -1692,6 +3375,167 @@ function revokeEdit() {
 
 .side-actions .btn {
   width: 100%;
+}
+
+/* ===== Пометки на коде ===== */
+.annotation-moderation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.annotation-moderation .btn.is-on,
+.annotation-moderation .btn.is-on:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.annotation-moderation .annotation-clear-btn.is-confirming,
+.annotation-moderation .annotation-clear-btn.is-confirming:hover {
+  background: var(--danger-soft);
+  border-color: rgba(229, 83, 61, 0.4);
+  color: var(--danger-text-hover);
+}
+
+.annotation-message {
+  margin: 0 0 10px;
+}
+
+.annotation-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.annotation-compose-excerpt {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 96px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.annotation-textarea {
+  min-height: 68px;
+  padding: 9px 11px;
+  font-size: 13px;
+  resize: vertical;
+}
+
+.annotation-compose-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.side-empty {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.annotation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.annotation-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.annotation-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-raised);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background-color 0.16s ease;
+}
+
+.annotation-row-main:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.annotation-row-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.annotation-author {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.annotation-file {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.annotation-row-text {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.annotation-row-delete {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.16s ease, border-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.annotation-row-delete:hover {
+  background: var(--danger-soft);
+  border-color: rgba(229, 83, 61, 0.35);
+  color: var(--danger-text-hover);
 }
 
 @media (max-width: 900px) {
@@ -1755,7 +3599,7 @@ function revokeEdit() {
   z-index: 50;
   display: grid;
   place-items: center;
-  background: rgba(9, 11, 16, 0.82);
+  background: var(--overlay);
 }
 
 .room-overlay-card {

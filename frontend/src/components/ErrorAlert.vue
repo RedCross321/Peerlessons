@@ -54,7 +54,7 @@ const list = computed(() => {
   place-items: center;
   border-radius: 50%;
   background: rgba(229, 83, 61, 0.22);
-  color: #ffb0a3;
+  color: var(--danger-text-muted);
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 700;
@@ -67,7 +67,7 @@ const list = computed(() => {
 
 .form-alert-title {
   margin: 0 0 4px;
-  color: #ffc2b8;
+  color: var(--danger-text-strong);
   font-size: 13px;
   font-weight: 700;
 }
@@ -78,7 +78,7 @@ const list = computed(() => {
   gap: 3px;
   margin: 0;
   padding-left: 16px;
-  color: #ffb0a3;
+  color: var(--danger-text-muted);
   font-size: 13px;
 }
 </style>

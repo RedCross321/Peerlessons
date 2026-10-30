@@ -35,14 +35,31 @@
       const stage = document.getElementById('stage')
 
       window.addEventListener('message', (event) => {
-        // Принимаем код только от родительской страницы.
+        // Принимаем только сообщения от приложения (родительской страницы).
         if (event.source !== window.parent) return
 
         const data = event.data
-        if (!data || data.type !== 'preview-html') return
-        if (typeof data.html !== 'string') return
+        if (!data) return
 
-        stage.srcdoc = data.html
+        if (data.type === 'preview-html') {
+          if (typeof data.html !== 'string') return
+          stage.srcdoc = data.html
+          return
+        }
+
+        // Событие взаимодействия ведущего для повтора во вложенном превью.
+        // Само превью шлёт события напрямую в окно приложения (window.top),
+        // поэтому обратная пересылка здесь не нужна.
+        if (data.type === 'preview-event' && data.event) {
+          stage.contentWindow?.postMessage(
+            {
+              source: 'peerlessons-preview',
+              action: 'replay',
+              event: data.event
+            },
+            '*'
+          )
+        }
       })
 
       // Родитель ждёт этот сигнал: до него сообщения могут потеряться.
