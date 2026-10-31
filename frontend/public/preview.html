@@ -33,6 +33,8 @@
 
     <script>
       const stage = document.getElementById('stage')
+      // Каждая вкладка мини-браузера загружает свою оболочку с собственным id.
+      const tabId = new URLSearchParams(window.location.search).get('tab') || ''
 
       window.addEventListener('message', (event) => {
         // Принимаем только сообщения от приложения (родительской страницы).
@@ -59,11 +61,23 @@
             },
             '*'
           )
+          return
+        }
+
+        // Команды панели разработчика: eval, DOM, подсветка элемента.
+        if (data.type === 'preview-command' && data.command) {
+          stage.contentWindow?.postMessage(
+            Object.assign({ source: 'peerlessons-app' }, data.command),
+            '*'
+          )
         }
       })
 
       // Родитель ждёт этот сигнал: до него сообщения могут потеряться.
-      window.parent.postMessage({ type: 'preview-ready' }, '*')
+      window.parent.postMessage(
+        { type: 'preview-ready', tab: tabId },
+        '*'
+      )
     </script>
   </body>
 </html>

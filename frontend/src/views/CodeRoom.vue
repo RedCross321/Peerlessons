@@ -8,8 +8,10 @@ import api, { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
 import AnnotationPopup from '@/components/AnnotationPopup.vue'
 import FileActionDialog from '@/components/FileActionDialog.vue'
 import ParticipantMenu from '@/components/ParticipantMenu.vue'
+import PreviewBrowser from '@/components/PreviewBrowser.vue'
 import { useTheme } from '@/theme'
 import { getErrorMessages } from '@/utils/errors'
+import { pickHtmlFile } from '@/utils/previewDocument.js'
 import { setPageSeo } from '@/utils/seo'
 
 const route = useRoute()
@@ -163,17 +165,16 @@ const annotateTitle = computed(() => {
 // Предпросмотр
 const showPreview = ref(false)
 const previewMode = ref('individual')
-const previewReady = ref(false)
-let pendingPreviewEvents = []
-const previewKey = ref(0)
-const previewHtml = ref('')
-const previewFrame = ref(null)
 const previewShellUrl = `${import.meta.env.BASE_URL}preview.html`
+const previewBrowser = ref(null)
+// События общего превью, накопленные до монтирования мини-браузера.
+let pendingPreviewEvents = []
+// Страница, которую ведущий показывает в общем режиме (приходит с сервера).
+const remotePreviewPage = ref(null)
 
 const canRefreshPreview = computed(
   () => previewMode.value === 'individual' || isHost.value
 )
-const PREVIEW_DEBOUNCE_MS = 600
 const previewWidth = ref(400)
 const isResizing = ref(false)
 const editorArea = ref(null)
@@ -182,6 +183,30 @@ const MIN_EDITOR_WIDTH = 320
 let resizeStartX = 0
 let resizeStartWidth = 0
 let layoutFrame = null
+
+// В общем режиме ведущий транслирует свои действия, остальные повторяют.
+const previewInteractionMode = computed(() => {
+  if (previewMode.value !== 'shared') return 'off'
+  return isHost.value ? 'capture' : 'replay'
+})
+
+// Наблюдатели не могут уводить общий показ на другую страницу.
+const previewReadonly = computed(
+  () => previewMode.value === 'shared' && !isHost.value
+)
+
+const previewStartFile = computed(() => {
+  if (previewMode.value === 'shared') {
+    const page = remotePreviewPage.value
+    if (page?.kind === 'file' && page.file) return page.file
+    return pickHtmlFile(files.value, editorTab.value)
+  }
+  return pickHtmlFile(files.value, activeTab.value)
+})
+
+const previewStartPage = computed(() =>
+  previewMode.value === 'shared' ? remotePreviewPage.value : null
+)
 
 // Удалённые курсоры
 const remoteSelections = ref({})
@@ -193,7 +218,6 @@ let wsGeneration = 0
 let reconnectTimer = null
 let reconnectAttempt = 0
 let shouldReconnect = true
-let previewTimer = null
 let ignoreChanges = false
 
 // ===== Утилиты =====
@@ -240,282 +264,6 @@ function toRemoteSelection(sel) {
     cursorLineNumber: sel.positionLineNumber,
     cursorColumn: sel.positionColumn
   }
-}
-
-function buildPreviewInteractionScript() {
-  const mode =
-    previewMode.value === 'shared'
-      ? isHost.value
-        ? 'capture'
-        : 'replay'
-      : 'off'
-
-  if (mode === 'off') return ''
-
-  return `
-<script>
-(function () {
-  var MODE = '${mode}';
-
-  function pathOf(element) {
-    var parts = [];
-    var node = element;
-    while (
-      node &&
-      node.nodeType === 1 &&
-      node !== document.documentElement &&
-      node.parentNode
-    ) {
-      var index = Array.prototype.indexOf.call(node.parentNode.children, node);
-      if (index < 0) return '';
-      parts.unshift(index);
-      node = node.parentNode;
-    }
-    return parts.join('/');
-  }
-
-  function elementAt(path) {
-    var node = document.documentElement;
-    if (!path) return node;
-    var parts = path.split('/');
-    for (var i = 0; i < parts.length; i += 1) {
-      node = node && node.children ? node.children[Number(parts[i])] : null;
-      if (!node) return null;
-    }
-    return node;
-  }
-
-  function post(payload) {
-    payload.source = 'peerlessons-preview';
-    try {
-      // Вложенное превью лежит внутри оболочки, но оболочка в sandbox
-      // имеет непрозрачный origin — надёжнее слать напрямую в окно приложения.
-      window.top.postMessage(payload, '*');
-    } catch (error) {
-      /* приложение недоступно */
-    }
-  }
-
-  function sendInteraction(detail) {
-    post({ action: 'interaction', event: detail });
-  }
-
-  if (MODE === 'capture') {
-    document.addEventListener('click', function (event) {
-      if (!event.isTrusted) return;
-      var target = event.target;
-      if (!target || target.nodeType !== 1) return;
-
-      var tag = target.tagName;
-      if (tag === 'SELECT' || tag === 'TEXTAREA') return;
-      if (tag === 'INPUT') {
-        var inputType = String(target.type || '').toLowerCase();
-        if (
-          ['button', 'submit', 'reset', 'image'].indexOf(inputType) === -1
-        ) {
-          return;
-        }
-      }
-
-      sendInteraction({ action: 'click', path: pathOf(target) });
-    }, true);
-
-    document.addEventListener('input', function (event) {
-      if (!event.isTrusted) return;
-      var target = event.target;
-      if (!target || target.nodeType !== 1) return;
-
-      var detail = { action: 'input', path: pathOf(target) };
-      if (typeof target.value === 'string') {
-        detail.value = target.value.slice(0, 2000);
-      } else if (target.isContentEditable) {
-        detail.value = String(target.textContent || '').slice(0, 2000);
-      }
-      if (typeof target.checked === 'boolean') detail.checked = target.checked;
-
-      sendInteraction(detail);
-    }, true);
-
-    document.addEventListener('change', function (event) {
-      if (!event.isTrusted) return;
-      var target = event.target;
-      if (!target || target.nodeType !== 1) return;
-
-      var detail = { action: 'change', path: pathOf(target) };
-      if (typeof target.value === 'string') detail.value = target.value;
-      if (typeof target.checked === 'boolean') detail.checked = target.checked;
-
-      sendInteraction(detail);
-    }, true);
-
-    ['keydown', 'keyup'].forEach(function (type) {
-      document.addEventListener(type, function (event) {
-        if (!event.isTrusted) return;
-        var target = event.target;
-        sendInteraction({
-          action: type,
-          path: target && target.nodeType === 1 ? pathOf(target) : '',
-          key: event.key,
-          code: event.code,
-          altKey: event.altKey,
-          ctrlKey: event.ctrlKey,
-          metaKey: event.metaKey,
-          shiftKey: event.shiftKey
-        });
-      }, true);
-    });
-  }
-
-  if (MODE === 'capture' || MODE === 'replay') {
-    window.addEventListener('message', function (event) {
-      var data = event.data;
-      if (!data || data.source !== 'peerlessons-preview') return;
-      if (data.action !== 'replay' || !data.event) return;
-
-      var detail = data.event;
-      var target = elementAt(detail.path || '');
-      if (!target) return;
-
-      if (detail.action === 'click') {
-        target.click();
-        return;
-      }
-
-      if (detail.action === 'input' || detail.action === 'change') {
-        if (detail.checked !== undefined && 'checked' in target) {
-          target.checked = Boolean(detail.checked);
-        } else if (detail.value !== undefined) {
-          if (target.isContentEditable) {
-            target.textContent = detail.value;
-          } else {
-            target.value = detail.value;
-          }
-        }
-
-        var kind = detail.action === 'input' ? 'input' : 'change';
-        target.dispatchEvent(new Event(kind, { bubbles: true }));
-        return;
-      }
-
-      if (detail.action === 'keydown' || detail.action === 'keyup') {
-        try {
-          target.focus();
-        } catch (error) {
-          /* элемент может быть нефокусируемым */
-        }
-
-        target.dispatchEvent(
-          new KeyboardEvent(detail.action, {
-            key: detail.key,
-            code: detail.code,
-            altKey: Boolean(detail.altKey),
-            ctrlKey: Boolean(detail.ctrlKey),
-            metaKey: Boolean(detail.metaKey),
-            shiftKey: Boolean(detail.shiftKey),
-            bubbles: true,
-            cancelable: true
-          })
-        );
-      }
-    });
-  }
-
-  post({ action: 'ready' });
-})();
-<\/script>`
-}
-
-function resolveFilesReference(reference) {
-  const clean = String(reference || '')
-    .replace(/^\.?\//, '')
-    .split(/[?#]/)[0]
-    .trim()
-
-  if (!clean) return ''
-  if (Object.prototype.hasOwnProperty.call(files.value, clean)) return clean
-
-  const lower = clean.toLowerCase()
-  return (
-    Object.keys(files.value).find(
-      (name) => name.toLowerCase() === lower
-    ) || ''
-  )
-}
-
-function getPreviewHtmlFile() {
-  const names = Object.keys(files.value)
-  const has = (name) =>
-    Object.prototype.hasOwnProperty.call(files.value, name)
-
-  // В общем режиме превью должно быть одинаковым у всех, поэтому
-  // ориентируемся на вкладку редактора, а не на личную вкладку клиента.
-  const referenceTab =
-    previewMode.value === 'shared' ? editorTab.value : activeTab.value
-
-  if (
-    referenceTab &&
-    referenceTab.toLowerCase().endsWith('.html') &&
-    has(referenceTab)
-  ) {
-    return referenceTab
-  }
-
-  if (has('index.html')) {
-    return 'index.html'
-  }
-
-  return names.find((name) => name.toLowerCase().endsWith('.html')) || ''
-}
-
-function generatePreviewContent() {
-  const htmlFile = getPreviewHtmlFile()
-
-  if (!htmlFile) {
-    return (
-      '<!DOCTYPE html><html><body style="margin:0;padding:20px;' +
-      'color:#667;font-family:sans-serif">' +
-      'Нет HTML-файлов для предпросмотра.</body></html>'
-    )
-  }
-
-  let html = files.value[htmlFile] || ''
-
-  // Подставляем содержимое CSS-файлов, на которые ссылается HTML.
-  html = html.replace(/<link\b[^>]*>/gi, (tag) => {
-    const href = /\bhref\s*=\s*["']([^"']+)["']/i.exec(tag)
-    if (!href) return tag
-
-    const name = resolveFilesReference(href[1])
-    if (!name || !name.toLowerCase().endsWith('.css')) return tag
-
-    return `<style>\n${files.value[name] || ''}\n</style>`
-  })
-
-  // Подставляем содержимое JS-файлов.
-  html = html.replace(
-    /<script\b([^>]*)>\s*<\/script>/gi,
-    (tag, attrs) => {
-      const src = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(attrs)
-      if (!src) return tag
-
-      const name = resolveFilesReference(src[1])
-      if (!name || !name.toLowerCase().endsWith('.js')) return tag
-
-      return `<script>\n${files.value[name] || ''}\n<\/script>`
-    }
-  )
-
-  const bridge = buildPreviewInteractionScript()
-  if (!bridge) return html
-
-  // Вставляем мост до закрытия body, чтобы браузер точно выполнил его
-  // в документе (а не за пределами </html>).
-  const bodyMatches = [...html.matchAll(/<\/body\s*>/gi)]
-  const lastBody = bodyMatches[bodyMatches.length - 1]
-
-  if (!lastBody) return html + bridge
-
-  return html.slice(0, lastBody.index) + bridge + html.slice(lastBody.index)
 }
 
 // Применяет изменения кода минимальной правкой, не сбрасывая скролл и модель.
@@ -570,104 +318,6 @@ function applyRemoteCode(nextValue) {
   }
 }
 
-function updatePreviewNow(force = false) {
-  clearTimeout(previewTimer)
-  previewReady.value = false
-  previewHtml.value = generatePreviewContent()
-
-  if (force) {
-    pendingPreviewEvents = []
-    previewKey.value++
-  }
-}
-
-function schedulePreviewUpdate() {
-  if (!showPreview.value) return
-
-  clearTimeout(previewTimer)
-  previewTimer = setTimeout(() => updatePreviewNow(), PREVIEW_DEBOUNCE_MS)
-}
-
-// Превью — отдельный документ (/preview.html) со своей, более мягкой CSP:
-// иначе внешние картинки и запросы к чужим API блокировались бы политикой сайта
-// (srcdoc-документ наследует её и ослабить не может).
-function postPreviewHtml() {
-  const frame = previewFrame.value
-  if (!frame?.contentWindow) return
-
-  previewReady.value = false
-
-  // targetOrigin '*' неизбежен: iframe в sandbox без allow-same-origin имеет
-  // непрозрачный origin, и сообщение с origin сайта до него не дойдёт.
-  frame.contentWindow.postMessage(
-    { type: 'preview-html', html: previewHtml.value },
-    '*'
-  )
-}
-
-// События, пришедшие до готовности превью (в т.ч. журнал для поздно
-// подключившихся), применяем сразу после его загрузки.
-function queuePreviewEvent(detail) {
-  if (!detail) return
-
-  if (previewReady.value && previewFrame.value?.contentWindow) {
-    previewFrame.value.contentWindow.postMessage(
-      { type: 'preview-event', event: detail },
-      '*'
-    )
-    return
-  }
-
-  pendingPreviewEvents.push(detail)
-  if (pendingPreviewEvents.length > 300) pendingPreviewEvents.shift()
-}
-
-function flushPreviewEvents() {
-  const frame = previewFrame.value
-  if (!frame?.contentWindow) return
-
-  const events = pendingPreviewEvents
-  pendingPreviewEvents = []
-
-  for (const detail of events) {
-    frame.contentWindow.postMessage({ type: 'preview-event', event: detail }, '*')
-  }
-}
-
-function onPreviewMessage(event) {
-  const data = event.data
-  if (!data) return
-
-  // Сообщения из встроенного превью приходят напрямую в приложение.
-  if (data.source === 'peerlessons-preview') {
-    if (data.action === 'ready') {
-      previewReady.value = true
-      flushPreviewEvents()
-      return
-    }
-
-    if (
-      data.action === 'interaction' &&
-      data.event &&
-      previewMode.value === 'shared' &&
-      isHost.value
-    ) {
-      send({ type: 'preview-interaction', event: data.event })
-    }
-    return
-  }
-
-  const frame = previewFrame.value
-  if (!frame || event.source !== frame.contentWindow) return
-
-  if (data.type === 'preview-ready') {
-    postPreviewHtml()
-  }
-}
-
-// Оболочка могла ещё не успеть подписаться — досылаем код по её сигналу.
-watch(previewHtml, postPreviewHtml)
-
 // ===== Инициализация =====
 onMounted(async () => {
   if (!isLoggedIn()) {
@@ -695,7 +345,6 @@ onMounted(async () => {
 
   await nextTick()
   window.addEventListener('resize', handleWindowResize)
-  window.addEventListener('message', onPreviewMessage)
 
   try {
       emmetHTML(monaco, ['html'])
@@ -903,7 +552,6 @@ onUnmounted(() => {
   shouldReconnect = false
   wsGeneration += 1
   clearTimeout(reconnectTimer)
-  clearTimeout(previewTimer)
   clearTimeout(annotationMessageTimer)
   clearTimeout(clearAnnotationsTimer)
   closeAnnotationPopup()
@@ -911,7 +559,6 @@ onUnmounted(() => {
 
   stopResize()
   window.removeEventListener('resize', handleWindowResize)
-  window.removeEventListener('message', onPreviewMessage)
   clearTimeout(inviteTimer)
 
   // ← НОВОЕ: очищаем свой курсор при уходе
@@ -1125,8 +772,7 @@ watch(canEdit, (val) => {
   }
 })
 
-// Предпросмотр обновляем только после паузы, а не на каждый символ.
-watch(files, schedulePreviewUpdate, { deep: true })
+// Изменения файлов мини-браузер пересобирает сам (с задержкой).
 
 // Смена темы сайта переключает и оформление редактора.
 watch(resolvedTheme, (value) => {
@@ -1145,12 +791,17 @@ watch(activeTab, () => {
   hasEditorSelection.value = false
   disposeAnnotationDecorations()
   refreshAnnotationDecorations()
-  schedulePreviewUpdate()
+
+  if (previewMode.value === 'individual') {
+    previewBrowser.value?.openFile(activeTab.value)
+  }
 })
 
 // В общем режиме переключение вкладки редактора меняет общий предпросмотр.
 watch(editorTab, () => {
-  if (previewMode.value === 'shared') schedulePreviewUpdate()
+  if (previewMode.value === 'shared' && isHost.value) {
+    previewBrowser.value?.openFile(editorTab.value)
+  }
 })
 
 // Новые и удалённые пометки не должны сбрасывать позиции остальных.
@@ -1226,13 +877,25 @@ async function connectWS() {
           activeTab.value = nextTab
         }
 
+        const wasMounted = Boolean(previewBrowser.value)
+
         showPreview.value = !!data.showPreview
         previewMode.value =
           data.previewMode === 'shared' ? 'shared' : 'individual'
-        if (data.showPreview) updatePreviewNow(true)
+        remotePreviewPage.value = data.previewPage || null
         pendingPreviewEvents = Array.isArray(data.previewEvents)
           ? [...data.previewEvents]
           : []
+        if (data.showPreview) {
+          nextTick(handleWindowResize)
+          nextTick(() => {
+            if (previewMode.value !== 'shared') return
+            if (!wasMounted || !previewBrowser.value) return
+
+            previewBrowser.value.applyRemotePage(remotePreviewPage.value)
+            previewBrowser.value.reloadWithEvents(pendingPreviewEvents)
+          })
+        }
 
         // Кто сейчас редактирует
         currentEditorId.value = data.currentEditor?.user_id ?? null
@@ -1382,28 +1045,59 @@ async function connectWS() {
 
     // ← ИЗМЕНЕНО: предпросмотр синхронизируется у всех
     if (data.type === 'preview-toggle') {
+      const wasMounted = Boolean(previewBrowser.value)
+
       showPreview.value = data.show
+      remotePreviewPage.value = data.page || null
+
       if (data.show) {
-        updatePreviewNow(true)
         pendingPreviewEvents = Array.isArray(data.events)
           ? [...data.events]
           : []
+
+        if (wasMounted) {
+          previewBrowser.value.applyRemotePage(remotePreviewPage.value)
+          previewBrowser.value.reloadWithEvents(pendingPreviewEvents)
+        }
+
+        nextTick(handleWindowResize)
+      } else {
+        pendingPreviewEvents = []
       }
     }
 
     if (data.type === 'preview-refresh') {
       pendingPreviewEvents = []
-      updatePreviewNow(true)
+      previewBrowser.value?.refresh()
     }
 
     if (data.type === 'preview-mode') {
       previewMode.value = data.mode === 'shared' ? 'shared' : 'individual'
-      if (showPreview.value) updatePreviewNow(true)
+      remotePreviewPage.value =
+        previewMode.value === 'shared' ? data.page || null : null
+
+      if (showPreview.value) {
+        previewBrowser.value?.applyRemotePage(remotePreviewPage.value)
+      }
+    }
+
+    if (data.type === 'preview-navigate' && data.page) {
+      if (previewMode.value === 'shared' && !isHost.value) {
+        remotePreviewPage.value = data.page
+        previewBrowser.value?.applyRemotePage(data.page)
+      }
     }
 
     if (data.type === 'preview-interaction' && data.event) {
       if (previewMode.value === 'shared' && !isHost.value) {
-        queuePreviewEvent(data.event)
+        if (previewBrowser.value) {
+          previewBrowser.value.replay(data.event)
+        } else {
+          pendingPreviewEvents.push(data.event)
+          if (pendingPreviewEvents.length > 300) {
+            pendingPreviewEvents.shift()
+          }
+        }
       }
     }
 
@@ -1976,13 +1670,27 @@ function handleWindowResize() {
 // ===== Действия =====
 function togglePreview() {
   // Видимость результата синхронизируется сервером для всех участников.
-  send({ type: 'preview-toggle', show: !showPreview.value })
+  const show = !showPreview.value
+  const message = { type: 'preview-toggle', show }
+
+  // При открытии сообщаем, какую страницу показываем. Это нужно
+  // поздно подключившимся участникам общего режима.
+  if (show) {
+    const page =
+      previewStartPage.value ||
+      (previewStartFile.value
+        ? { kind: 'file', file: previewStartFile.value }
+        : null)
+    if (page) message.page = page
+  }
+
+  send(message)
 }
 
 function refreshPreview() {
   if (!canRefreshPreview.value) return
 
-  updatePreviewNow(true)
+  previewBrowser.value?.refresh()
 
   if (previewMode.value === 'shared') {
     send({ type: 'preview-refresh' })
@@ -1992,10 +1700,37 @@ function refreshPreview() {
 function togglePreviewMode() {
   if (!isHost.value) return
 
-  send({
-    type: 'preview-mode',
-    mode: previewMode.value === 'shared' ? 'individual' : 'shared'
-  })
+  const mode = previewMode.value === 'shared' ? 'individual' : 'shared'
+  const message = { type: 'preview-mode', mode }
+
+  if (mode === 'shared') {
+    const page =
+      previewBrowser.value?.getActivePage?.() ||
+      previewStartPage.value ||
+      (previewStartFile.value
+        ? { kind: 'file', file: previewStartFile.value }
+        : null)
+    if (page) message.page = page
+  }
+
+  send(message)
+}
+
+function onPreviewInteraction(detail) {
+  if (!detail) return
+  send({ type: 'preview-interaction', event: detail })
+}
+
+function onPreviewNavigate(page) {
+  if (!isHost.value || !page) return
+
+  remotePreviewPage.value = page
+  send({ type: 'preview-navigate', page })
+}
+
+function onPreviewOpenFile(file) {
+  if (!file) return
+  selectTab(file)
 }
 
 function raiseHand() {
@@ -2467,25 +2202,23 @@ function toggleAnnotationBanFromMenu() {
                 </button>
               </div>
             </div>
-            <!-- allow-same-origin намеренно не включён: пользовательский код
-                 не должен получать доступ к localStorage и DOM родителя. -->
-            <iframe
-              ref="previewFrame"
-              :key="previewKey"
-              :src="previewShellUrl"
-              sandbox="allow-scripts allow-modals allow-forms"
-              referrerpolicy="no-referrer"
-              :class="[
-                'preview-frame',
-                {
-                  'preview-frame--readonly':
-                    previewMode === 'shared' && !isHost
-                }
-              ]"
-              :tabindex="previewMode === 'shared' && !isHost ? -1 : 0"
-              title="Code Preview"
-              @load="postPreviewHtml"
-            ></iframe>
+            <!-- Мини-браузер: вкладки, адресная строка и панель разработчика.
+                 Пользовательский код по-прежнему живёт в sandbox без
+                 allow-same-origin и не может добраться до приложения. -->
+            <PreviewBrowser
+              ref="previewBrowser"
+              :files="files"
+              :shell-url="previewShellUrl"
+              :start-file="previewStartFile"
+              :start-page="previewStartPage"
+              :interaction-mode="previewInteractionMode"
+              :readonly="previewReadonly"
+              :shared="previewMode === 'shared'"
+              :initial-events="pendingPreviewEvents"
+              @interaction="onPreviewInteraction"
+              @navigate="onPreviewNavigate"
+              @open-file="onPreviewOpenFile"
+            />
           </div>
         </div>
       </section>
@@ -3108,7 +2841,9 @@ function toggleAnnotationBanFromMenu() {
   display: flex;
   flex-direction: column;
   min-width: 250px;
-  background: #fff;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-raised);
   border-left: 1px solid var(--border);
 }
 
@@ -3118,9 +2853,9 @@ function toggleAnnotationBanFromMenu() {
   align-items: center;
   justify-content: space-between;
   padding: 8px 12px;
-  background: #f4f5f7;
-  border-bottom: 1px solid #dfe2e8;
-  color: #3a4150;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
 }
 
 .preview-title {
@@ -3141,8 +2876,8 @@ function toggleAnnotationBanFromMenu() {
 .preview-mode-tag {
   padding: 2px 6px;
   border-radius: 5px;
-  background: #e7ebf2;
-  color: #5a6373;
+  background: var(--surface-3);
+  color: var(--text-muted);
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
@@ -3150,10 +2885,10 @@ function toggleAnnotationBanFromMenu() {
 
 .preview-mode-btn {
   padding: 3px 8px;
-  border: 1px solid #d7dbe3;
+  border: 1px solid var(--border);
   border-radius: 6px;
   background: transparent;
-  color: #4a5160;
+  color: var(--text-muted);
   font-size: 11.5px;
   font-weight: 600;
   line-height: 1.2;
@@ -3164,15 +2899,15 @@ function toggleAnnotationBanFromMenu() {
 }
 
 .preview-mode-btn:hover {
-  background: #e7e9ee;
-  border-color: #c3c8d2;
-  color: #191c23;
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .preview-mode-btn.is-on {
-  background: #e3edff;
-  border-color: #b9ccf0;
-  color: #2b57a8;
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent-strong);
 }
 
 .preview-dot {
@@ -3188,10 +2923,10 @@ function toggleAnnotationBanFromMenu() {
   display: grid;
   place-items: center;
   padding: 0;
-  border: 1px solid #d7dbe3;
+  border: 1px solid var(--border);
   border-radius: 7px;
   background: transparent;
-  color: #4a5160;
+  color: var(--text-muted);
   font-size: 17px;
   line-height: 1;
   cursor: pointer;
@@ -3199,21 +2934,9 @@ function toggleAnnotationBanFromMenu() {
 }
 
 .icon-btn:hover {
-  background: #e7e9ee;
-  border-color: #c3c8d2;
-  color: #191c23;
-}
-
-.preview-frame {
-  width: 100%;
-  height: 100%;
-  border: 0;
-  background: #fff;
-}
-
-/* В общем режиме наблюдатели не могут взаимодействовать с чужим превью. */
-.preview-frame--readonly {
-  pointer-events: none;
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .sidebar {

@@ -4,6 +4,7 @@ import re
 import unicodedata
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from captcha import get_client_ip, verify_turnstile
@@ -311,6 +312,7 @@ class ConnectionManager:
                 "annotationsLocked": False,  # True — пометки создаёт только ведущий
                 "previewMode": "individual",  # individual | shared
                 "previewEvents": [],  # журнал взаимодействий с общим превью
+                "previewPage": None,  # страница, которую показывает ведущий
             }
         return self.room_state[room_id]
 
@@ -1562,6 +1564,8 @@ class RoomSession:
                 await self._handle_annotation_lock(data)
             case "preview-mode":
                 await self._handle_preview_mode(data)
+            case "preview-navigate":
+                await self._handle_preview_navigate(data)
             case "preview-interaction":
                 await self._handle_preview_interaction(data)
             case "preview-toggle":
@@ -2078,8 +2082,106 @@ class RoomSession:
         self.state["previewMode"] = mode
         # При смене режима превью перезагружается у всех — журнал начинаем заново.
         self.state["previewEvents"] = []
+
+        page = self._normalize_preview_page(data.get("page"))
+        if page is not None:
+            self.state["previewPage"] = page
+
+        message: dict[str, Any] = {"type": "preview-mode", "mode": mode}
+        if mode == "shared":
+            message["page"] = self._current_preview_page()
+
+        await manager.broadcast(self.room_id, message)
+
+    def _normalize_preview_page(self, page: Any) -> dict[str, Any] | None:
+        """Проверяет страницу, которую клиент просит показать всем."""
+        if not isinstance(page, dict):
+            return None
+
+        kind = page.get("kind")
+
+        if kind == "file":
+            file_name = page.get("file")
+            if not isinstance(file_name, str) or len(file_name) > 255:
+                return None
+
+            safe_code = (
+                self.current_room.current_code
+                if isinstance(self.current_room.current_code, dict)
+                else {}
+            )
+            files = safe_code.get("files")
+            if not isinstance(files, dict) or file_name not in files:
+                return None
+            if not file_name.lower().endswith((".html", ".htm")):
+                return None
+
+            return {"kind": "file", "file": file_name}
+
+        if kind == "external":
+            url = page.get("url")
+            if not isinstance(url, str) or not url or len(url) > 2048:
+                return None
+
+            try:
+                parsed = urlparse(url)
+            except ValueError:
+                return None
+
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                return None
+
+            return {"kind": "external", "url": url}
+
+        return None
+
+    def _default_preview_page(self) -> dict[str, Any] | None:
+        safe_code = (
+            self.current_room.current_code
+            if isinstance(self.current_room.current_code, dict)
+            else {}
+        )
+        files = safe_code.get("files")
+        if not isinstance(files, dict):
+            return None
+
+        candidates: list[str] = []
+        active_tab = safe_code.get("activeTab")
+        if isinstance(active_tab, str):
+            candidates.append(active_tab)
+        if "index.html" in files:
+            candidates.append("index.html")
+        candidates.extend(files.keys())
+
+        for name in candidates:
+            page = self._normalize_preview_page({"kind": "file", "file": name})
+            if page is not None:
+                return page
+
+        return None
+
+    def _current_preview_page(self) -> dict[str, Any] | None:
+        """Актуальная страница общего превью (файл могли удалить)."""
+        return self._normalize_preview_page(self.state.get("previewPage"))
+
+    async def _handle_preview_navigate(self, data: dict[str, Any]) -> None:
+        if self.state.get("previewMode") != "shared":
+            return
+        if self.current_room.host_id != self.user_id:
+            return
+
+        page = self._normalize_preview_page(data.get("page"))
+        if page is None:
+            return
+
+        self.state["previewPage"] = page
+        # Пути событий относятся к старому DOM — журнал начинаем заново.
+        self.state["previewEvents"] = []
+
         await manager.broadcast(
-            self.room_id, {"type": "preview-mode", "mode": mode}
+            self.room_id,
+            {"type": "preview-navigate", "page": page},
+            exclude=self.websocket,
         )
 
     async def _handle_preview_interaction(self, data: dict[str, Any]) -> None:
@@ -2143,8 +2245,19 @@ class RoomSession:
         self.state["showPreview"] = show
 
         message: dict[str, Any] = {"type": "preview-toggle", "show": show}
-        if show and self.state.get("previewMode") == "shared":
-            message["events"] = list(self.state.get("previewEvents", []))
+        if self.state.get("previewMode") == "shared":
+            if show:
+                page = (
+                    self._normalize_preview_page(data.get("page"))
+                    or self._current_preview_page()
+                    or self._default_preview_page()
+                )
+                if page is not None:
+                    self.state["previewPage"] = page
+                message["page"] = page
+                message["events"] = list(
+                    self.state.get("previewEvents", [])
+                )
 
         # Отправитель тоже должен получить журнал взаимодействий.
         await manager.broadcast(self.room_id, message)
@@ -2237,6 +2350,11 @@ class RoomSession:
                     self.state.get("annotationBans", set())
                 ),
                 "previewMode": self.state.get("previewMode", "individual"),
+                "previewPage": (
+                    self._current_preview_page()
+                    if self.state.get("previewMode") == "shared"
+                    else None
+                ),
                 "previewEvents": list(self.state.get("previewEvents", []))
                 if self.state.get("previewMode") == "shared"
                 else [],
