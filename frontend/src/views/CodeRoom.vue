@@ -1,26 +1,32 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, defineAsyncComponent, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import '@/monaco-workers'
-import * as monaco from 'monaco-editor'
-import { emmetHTML, emmetCSS, emmetJSX } from 'emmet-monaco-es'
+import * as monaco from 'monaco-editor/editor/editor.api.js'
+import 'monaco-editor/features/register.all.js'
+import 'monaco-editor/languages/definitions/html/register.js'
+import 'monaco-editor/languages/definitions/css/register.js'
+import 'monaco-editor/languages/definitions/javascript/register.js'
+import 'monaco-editor/language/html/monaco.contribution.js'
+import 'monaco-editor/language/css/monaco.contribution.js'
 import api, { getUser, isLoggedIn, ensureValidAccessToken } from '@/auth'
 import AnnotationPopup from '@/components/AnnotationPopup.vue'
+import ChatPanel from '@/components/ChatPanel.vue'
 import FileActionDialog from '@/components/FileActionDialog.vue'
 import ParticipantMenu from '@/components/ParticipantMenu.vue'
-import PreviewBrowser from '@/components/PreviewBrowser.vue'
 import { useTheme } from '@/theme'
 import { getErrorMessages } from '@/utils/errors'
 import { pickHtmlFile } from '@/utils/previewDocument.js'
 import { setPageSeo } from '@/utils/seo'
+
+const PreviewBrowser = defineAsyncComponent(() => import('@/components/PreviewBrowser.vue'))
 
 const route = useRoute()
 const router = useRouter()
 
 const { resolvedTheme } = useTheme()
 
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 // В адресе может быть и UUID, и псевдоним комнаты.
 const roomKey = String(route.params.id || '')
@@ -44,8 +50,7 @@ const roomLink = computed(() => {
 
 setPageSeo({
   title: 'Комната — Peerlessons',
-  description:
-    'Приватная комната совместного редактирования кода в Peerlessons.',
+  description: 'Приватная комната совместного редактирования кода в Peerlessons.',
   path: `/room/${roomKey}`,
   robots: 'noindex, nofollow',
   canonical: false,
@@ -73,7 +78,7 @@ const files = ref({
   'main.js': `console.log("Код запущен!");
 document.querySelector("h1").addEventListener("click", () => {
   alert("Привет!");
-});`
+});`,
 })
 
 const activeTab = ref('index.html')
@@ -123,9 +128,7 @@ const annotationRanges = new Map()
 
 const annotationInput = ref(null)
 
-const hasRaisedHand = computed(() =>
-  raisedHands.value.some(h => h.user_id === myUserId.value)
-)
+const hasRaisedHand = computed(() => raisedHands.value.some((h) => h.user_id === myUserId.value))
 
 // Порядок поднятых рук = порядок поднятия; такие участники идут вверху списка.
 const raisedHandOrder = computed(() => {
@@ -172,9 +175,7 @@ let pendingPreviewEvents = []
 // Страница, которую ведущий показывает в общем режиме (приходит с сервера).
 const remotePreviewPage = ref(null)
 
-const canRefreshPreview = computed(
-  () => previewMode.value === 'individual' || isHost.value
-)
+const canRefreshPreview = computed(() => previewMode.value === 'individual' || isHost.value)
 const previewWidth = ref(400)
 const isResizing = ref(false)
 const editorArea = ref(null)
@@ -191,9 +192,7 @@ const previewInteractionMode = computed(() => {
 })
 
 // Наблюдатели не могут уводить общий показ на другую страницу.
-const previewReadonly = computed(
-  () => previewMode.value === 'shared' && !isHost.value
-)
+const previewReadonly = computed(() => previewMode.value === 'shared' && !isHost.value)
 
 const previewStartFile = computed(() => {
   if (previewMode.value === 'shared') {
@@ -205,7 +204,7 @@ const previewStartFile = computed(() => {
 })
 
 const previewStartPage = computed(() =>
-  previewMode.value === 'shared' ? remotePreviewPage.value : null
+  previewMode.value === 'shared' ? remotePreviewPage.value : null,
 )
 
 // Удалённые курсоры
@@ -214,6 +213,7 @@ const remoteCaretWidgets = new Map()
 let decorationsCollection = null
 let editor = null
 let ws = null
+const wsSocket = ref(null)
 let wsGeneration = 0
 let reconnectTimer = null
 let reconnectAttempt = 0
@@ -226,7 +226,16 @@ function monacoThemeId(value) {
 }
 
 function getUserColor(userId) {
-  const colors = ['#e06c75', '#98c379', '#e5c07b', '#61afef', '#c678dd', '#56b6c2', '#d19a66', '#56b6c2']
+  const colors = [
+    '#e06c75',
+    '#98c379',
+    '#e5c07b',
+    '#61afef',
+    '#c678dd',
+    '#56b6c2',
+    '#d19a66',
+    '#56b6c2',
+  ]
   let hash = 0
   const str = String(userId)
   for (let i = 0; i < str.length; i++) {
@@ -262,7 +271,7 @@ function toRemoteSelection(sel) {
     endColumn: sel.endColumn,
     // Активная граница выделения — именно там рисуется каретка.
     cursorLineNumber: sel.positionLineNumber,
-    cursorColumn: sel.positionColumn
+    cursorColumn: sel.positionColumn,
   }
 }
 
@@ -286,11 +295,7 @@ function applyRemoteCode(nextValue) {
   let endOld = currentValue.length
   let endNew = nextValue.length
 
-  while (
-    endOld > start &&
-    endNew > start &&
-    currentValue[endOld - 1] === nextValue[endNew - 1]
-  ) {
+  while (endOld > start && endNew > start && currentValue[endOld - 1] === nextValue[endNew - 1]) {
     endOld -= 1
     endNew -= 1
   }
@@ -307,11 +312,11 @@ function applyRemoteCode(nextValue) {
           startPos.lineNumber,
           startPos.column,
           endPos.lineNumber,
-          endPos.column
+          endPos.column,
         ),
         text: nextValue.slice(start, endNew),
-        forceMoveMarkers: true
-      }
+        forceMoveMarkers: true,
+      },
     ])
   } finally {
     ignoreChanges = false
@@ -328,9 +333,7 @@ onMounted(async () => {
   // В адресе может быть псевдоним — сначала узнаём UUID комнаты.
   if (!roomId.value) {
     try {
-      const { data } = await api.get(
-        `/rooms/by-alias/${encodeURIComponent(roomKey)}`
-      )
+      const { data } = await api.get(`/rooms/by-alias/${encodeURIComponent(roomKey)}`)
 
       roomId.value = data.id
       roomTitle.value = data.title || ''
@@ -347,157 +350,140 @@ onMounted(async () => {
   window.addEventListener('resize', handleWindowResize)
 
   try {
-      emmetHTML(monaco, ['html'])
-      emmetCSS(monaco, ['css'])
-      emmetJSX(monaco, ['javascript'])
-    } catch (e) {
-      console.warn('Emmet init failed:', e)
+    const { emmetHTML, emmetCSS, emmetJSX } = await import('emmet-monaco-es')
+    emmetHTML(monaco, ['html'])
+    emmetCSS(monaco, ['css'])
+    emmetJSX(monaco, ['javascript'])
+  } catch (e) {
+    console.warn('Emmet init failed:', e)
   }
 
   try {
-      // JS / TS
-      if (monaco.languages?.typescript?.javascriptDefaults) {
-        monaco.languages.typescript.javascriptDefaults.setCompilerOptions({
-          target: monaco.languages.typescript.ScriptTarget.ESNext,
-          allowNonTsExtensions: true,
-          moduleResolution: monaco.languages.typescript.ModuleResolutionKind.NodeJs,
-          module: monaco.languages.typescript.ModuleKind.ESNext,
-          noEmit: true,
-          esModuleInterop: true,
-          allowJs: true,
-          checkJs: false,
-        })
-        monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
-          noSemanticValidation: true,   // меньше шума в простом JS
-          noSyntaxValidation: false,
-        })
-      }
-
-      // HTML
-      if (monaco.languages?.html?.htmlDefaults) {
-        monaco.languages.html.htmlDefaults.setOptions({
-          format: { tabSize: 2, insertSpaces: true },
-          suggest: { html5: true },
-        })
-      }
-
-      // CSS
-      if (monaco.languages?.css?.cssDefaults) {
-        monaco.languages.css.cssDefaults.setOptions({
-          validate: true,
-        })
-      }
-    } catch (e) {
-      console.warn('Language services init failed:', e)
+    // HTML
+    if (monaco.languages?.html?.htmlDefaults) {
+      monaco.languages.html.htmlDefaults.setOptions({
+        format: { tabSize: 2, insertSpaces: true },
+        suggest: { html5: true },
+      })
     }
 
-    monaco.editor.defineTheme('peerless-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      rules: [
-        { token: 'comment', foreground: '6d7789', fontStyle: 'italic' },
-        { token: 'keyword', foreground: 'ff9163' },
-        { token: 'string', foreground: 'a9c9a4' },
-        { token: 'number', foreground: 'e8c07d' },
-        { token: 'tag', foreground: 'ff7a45' },
-        { token: 'attribute.name', foreground: 'cdd4e0' },
-        { token: 'attribute.value', foreground: 'a9c9a4' }
-      ],
-      colors: {
-        'editor.background': '#0f1219',
-        'editor.foreground': '#e9edf4',
-        'editorLineNumber.foreground': '#39404f',
-        'editorLineNumber.activeForeground': '#9aa4b6',
-        'editor.lineHighlightBackground': '#151a24',
-        'editor.selectionBackground': '#ff7a4538',
-        'editor.inactiveSelectionBackground': '#ff7a451c',
-        'editorCursor.foreground': '#ff7a45',
-        'editorIndentGuide.background1': '#1c2230',
-        'editorIndentGuide.activeBackground1': '#2c3546',
-        'editorWidget.background': '#121620',
-        'editorWidget.border': '#222a39',
-        'editorSuggestWidget.background': '#121620',
-        'editorSuggestWidget.border': '#222a39',
-        'editorSuggestWidget.selectedBackground': '#1d2432',
-        'scrollbarSlider.background': '#2a324280',
-        'scrollbarSlider.hoverBackground': '#39435a',
-        'scrollbarSlider.activeBackground': '#4a5570'
-      }
-    })
-
-    monaco.editor.defineTheme('peerless-light', {
-      base: 'vs',
-      inherit: true,
-      rules: [
-        { token: 'comment', foreground: '7d8697', fontStyle: 'italic' },
-        { token: 'keyword', foreground: 'c44a17' },
-        { token: 'string', foreground: '2f7d4f' },
-        { token: 'number', foreground: '9a6700' },
-        { token: 'tag', foreground: 'c44a17' },
-        { token: 'attribute.name', foreground: '3a4150' },
-        { token: 'attribute.value', foreground: '2f7d4f' }
-      ],
-      colors: {
-        'editor.background': '#ffffff',
-        'editor.foreground': '#1d2027',
-        'editorLineNumber.foreground': '#b3bac6',
-        'editorLineNumber.activeForeground': '#5b6474',
-        'editor.lineHighlightBackground': '#f4f5f8',
-        'editor.selectionBackground': '#de5a2245',
-        'editor.inactiveSelectionBackground': '#de5a2220',
-        'editorCursor.foreground': '#de5a22',
-        'editorIndentGuide.background1': '#e6e9ef',
-        'editorIndentGuide.activeBackground1': '#c8cfda',
-        'editorWidget.background': '#ffffff',
-        'editorWidget.border': '#dfe3ea',
-        'editorSuggestWidget.background': '#ffffff',
-        'editorSuggestWidget.border': '#dfe3ea',
-        'editorSuggestWidget.selectedBackground': '#f0f2f6',
-        'scrollbarSlider.background': '#c8cfda80',
-        'scrollbarSlider.hoverBackground': '#b0b8c6',
-        'scrollbarSlider.activeBackground': '#98a1b3'
-      }
-    })
-
-    editor = monaco.editor.create(document.getElementById('editor'), {
-        value: files.value[activeTab.value],
-        language: getLang(activeTab.value),
-        theme: monacoThemeId(resolvedTheme.value),
-        readOnly: true,
-        automaticLayout: true,
-        minimap: { enabled: false },
-        fontSize: 14,
-        lineHeight: 22,
-        fontFamily: "'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace",
-        padding: { top: 14, bottom: 14 },
-        cursorBlinking: 'smooth',
-        smoothScrolling: true,
-        renderLineHighlight: 'line',
-        scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10 },
-        tabSize: 2,
-        insertSpaces: true,
-
-        quickSuggestions: {
-          other: true,
-          comments: false,
-          strings: true,
-        },
-        suggestOnTriggerCharacters: true,
-        acceptSuggestionOnEnter: 'on',
-        tabCompletion: 'on',
-        wordBasedSuggestions: 'currentDocument',
-        snippetSuggestions: 'top',
-        suggest: {
-          preview: true,
-          showInlineDetails: true,
-          snippetsPreventQuickSuggestions: false,
-        },
-        parameterHints: { enabled: true },
-        autoClosingBrackets: 'always',
-        autoClosingQuotes: 'always',
-        formatOnPaste: true,
-        formatOnType: false,
+    // CSS
+    if (monaco.languages?.css?.cssDefaults) {
+      monaco.languages.css.cssDefaults.setOptions({
+        validate: true,
       })
+    }
+  } catch (e) {
+    console.warn('Language services init failed:', e)
+  }
+
+  monaco.editor.defineTheme('peerless-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'comment', foreground: '6d7789', fontStyle: 'italic' },
+      { token: 'keyword', foreground: 'ff9163' },
+      { token: 'string', foreground: 'a9c9a4' },
+      { token: 'number', foreground: 'e8c07d' },
+      { token: 'tag', foreground: 'ff7a45' },
+      { token: 'attribute.name', foreground: 'cdd4e0' },
+      { token: 'attribute.value', foreground: 'a9c9a4' },
+    ],
+    colors: {
+      'editor.background': '#0f1219',
+      'editor.foreground': '#e9edf4',
+      'editorLineNumber.foreground': '#39404f',
+      'editorLineNumber.activeForeground': '#9aa4b6',
+      'editor.lineHighlightBackground': '#151a24',
+      'editor.selectionBackground': '#ff7a4538',
+      'editor.inactiveSelectionBackground': '#ff7a451c',
+      'editorCursor.foreground': '#ff7a45',
+      'editorIndentGuide.background1': '#1c2230',
+      'editorIndentGuide.activeBackground1': '#2c3546',
+      'editorWidget.background': '#121620',
+      'editorWidget.border': '#222a39',
+      'editorSuggestWidget.background': '#121620',
+      'editorSuggestWidget.border': '#222a39',
+      'editorSuggestWidget.selectedBackground': '#1d2432',
+      'scrollbarSlider.background': '#2a324280',
+      'scrollbarSlider.hoverBackground': '#39435a',
+      'scrollbarSlider.activeBackground': '#4a5570',
+    },
+  })
+
+  monaco.editor.defineTheme('peerless-light', {
+    base: 'vs',
+    inherit: true,
+    rules: [
+      { token: 'comment', foreground: '7d8697', fontStyle: 'italic' },
+      { token: 'keyword', foreground: 'c44a17' },
+      { token: 'string', foreground: '2f7d4f' },
+      { token: 'number', foreground: '9a6700' },
+      { token: 'tag', foreground: 'c44a17' },
+      { token: 'attribute.name', foreground: '3a4150' },
+      { token: 'attribute.value', foreground: '2f7d4f' },
+    ],
+    colors: {
+      'editor.background': '#ffffff',
+      'editor.foreground': '#1d2027',
+      'editorLineNumber.foreground': '#b3bac6',
+      'editorLineNumber.activeForeground': '#5b6474',
+      'editor.lineHighlightBackground': '#f4f5f8',
+      'editor.selectionBackground': '#de5a2245',
+      'editor.inactiveSelectionBackground': '#de5a2220',
+      'editorCursor.foreground': '#de5a22',
+      'editorIndentGuide.background1': '#e6e9ef',
+      'editorIndentGuide.activeBackground1': '#c8cfda',
+      'editorWidget.background': '#ffffff',
+      'editorWidget.border': '#dfe3ea',
+      'editorSuggestWidget.background': '#ffffff',
+      'editorSuggestWidget.border': '#dfe3ea',
+      'editorSuggestWidget.selectedBackground': '#f0f2f6',
+      'scrollbarSlider.background': '#c8cfda80',
+      'scrollbarSlider.hoverBackground': '#b0b8c6',
+      'scrollbarSlider.activeBackground': '#98a1b3',
+    },
+  })
+
+  editor = monaco.editor.create(document.getElementById('editor'), {
+    value: files.value[activeTab.value],
+    language: getLang(activeTab.value),
+    theme: monacoThemeId(resolvedTheme.value),
+    readOnly: true,
+    automaticLayout: true,
+    minimap: { enabled: false },
+    fontSize: 14,
+    lineHeight: 22,
+    fontFamily: "'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace",
+    padding: { top: 14, bottom: 14 },
+    cursorBlinking: 'smooth',
+    smoothScrolling: true,
+    renderLineHighlight: 'line',
+    scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10 },
+    tabSize: 2,
+    insertSpaces: true,
+
+    quickSuggestions: {
+      other: true,
+      comments: false,
+      strings: true,
+    },
+    suggestOnTriggerCharacters: true,
+    acceptSuggestionOnEnter: 'on',
+    tabCompletion: 'on',
+    wordBasedSuggestions: 'currentDocument',
+    snippetSuggestions: 'top',
+    suggest: {
+      preview: true,
+      showInlineDetails: true,
+      snippetsPreventQuickSuggestions: false,
+    },
+    parameterHints: { enabled: true },
+    autoClosingBrackets: 'always',
+    autoClosingQuotes: 'always',
+    formatOnPaste: true,
+    formatOnType: false,
+  })
 
   // Пересчитываем метрики после загрузки веб-шрифта: иначе Monaco
   // может остаться на системном фолбэке.
@@ -513,7 +499,7 @@ onMounted(async () => {
     send({
       type: 'code-update',
       files: files.value,
-      activeTab: activeTab.value
+      activeTab: activeTab.value,
     })
   })
 
@@ -526,7 +512,7 @@ onMounted(async () => {
     send({
       type: 'cursor-update',
       selection: toRemoteSelection(sel),
-      color: getUserColor(myUserId.value)
+      color: getUserColor(myUserId.value),
     })
   })
 
@@ -571,6 +557,7 @@ onUnmounted(() => {
   decorationsCollection = null
   ws?.close()
   ws = null
+  wsSocket.value = null
 })
 
 function getLang(name) {
@@ -591,9 +578,15 @@ function fileKind(name) {
 }
 
 function initials(name) {
-  const parts = String(name || '').trim().split(/[\s_]+/).filter(Boolean)
+  const parts = String(name || '')
+    .trim()
+    .split(/[\s_]+/)
+    .filter(Boolean)
   if (!parts.length) return '?'
-  return parts.slice(0, 2).map(part => part[0].toUpperCase()).join('')
+  return parts
+    .slice(0, 2)
+    .map((part) => part[0].toUpperCase())
+    .join('')
 }
 
 function switchTab(name) {
@@ -615,12 +608,9 @@ function switchTab(name) {
   disposeAnnotationDecorations()
 
   const lang = getLang(name)
-    const oldModel = editor.getModel()
-    const newModel = monaco.editor.createModel(
-      files.value[name] || '',
-      lang
-    )
-    editor.setModel(newModel)
+  const oldModel = editor.getModel()
+  const newModel = monaco.editor.createModel(files.value[name] || '', lang)
+  editor.setModel(newModel)
   oldModel?.dispose()
 
   ignoreChanges = false
@@ -638,7 +628,7 @@ function switchTab(name) {
         send({
           type: 'cursor-update',
           selection: toRemoteSelection(sel),
-          color: getUserColor(myUserId.value)
+          color: getUserColor(myUserId.value),
         })
       }
     })
@@ -656,6 +646,33 @@ function selectTab(name) {
   }
 
   switchTab(name)
+}
+
+function onEditorTabKeydown(event, index) {
+  const names = Object.keys(files.value)
+  if (!names.length) return
+
+  let nextIndex = index
+
+  if (event.key === 'ArrowRight') {
+    nextIndex = (index + 1) % names.length
+  } else if (event.key === 'ArrowLeft') {
+    nextIndex = (index - 1 + names.length) % names.length
+  } else if (event.key === 'Home') {
+    nextIndex = 0
+  } else if (event.key === 'End') {
+    nextIndex = names.length - 1
+  } else {
+    return
+  }
+
+  event.preventDefault()
+  selectTab(names[nextIndex])
+
+  nextTick(() => {
+    const tabs = document.querySelectorAll('.tabs .tab')
+    tabs[nextIndex]?.focus()
+  })
 }
 
 function toggleFollow() {
@@ -676,10 +693,7 @@ function loadTabIntoEditor(name) {
   ignoreChanges = true
 
   try {
-    const model = monaco.editor.createModel(
-      files.value[name] || '',
-      getLang(name)
-    )
+    const model = monaco.editor.createModel(files.value[name] || '', getLang(name))
     editor.setModel(model)
   } finally {
     ignoreChanges = false
@@ -700,11 +714,8 @@ function applyFilesUpdate(nextFiles, serverActiveTab) {
 
   const has = (name) => Object.prototype.hasOwnProperty.call(nextFiles, name)
   const serverTab =
-    typeof serverActiveTab === 'string' && has(serverActiveTab)
-      ? serverActiveTab
-      : ''
-  const fallback =
-    serverTab || (has('index.html') ? 'index.html' : names[0])
+    typeof serverActiveTab === 'string' && has(serverActiveTab) ? serverActiveTab : ''
+  const fallback = serverTab || (has('index.html') ? 'index.html' : names[0])
 
   let nextTab = activeTab.value
   if (!has(nextTab)) {
@@ -738,14 +749,9 @@ function applyFilesUpdate(nextFiles, serverActiveTab) {
   // Пометки удалённых файлов больше некуда привязать.
   const present = new Set(names)
   if (annotations.value.some((annotation) => !present.has(annotation.file))) {
-    annotations.value = annotations.value.filter((annotation) =>
-      present.has(annotation.file)
-    )
+    annotations.value = annotations.value.filter((annotation) => present.has(annotation.file))
   }
-  if (
-    annotationPopup.value &&
-    !present.has(annotationPopup.value.annotation.file)
-  ) {
+  if (annotationPopup.value && !present.has(annotationPopup.value.annotation.file)) {
     closeAnnotationPopup()
   }
 }
@@ -762,7 +768,7 @@ watch(canEdit, (val) => {
         send({
           type: 'cursor-update',
           selection: toRemoteSelection(sel),
-          color: getUserColor(myUserId.value)
+          color: getUserColor(myUserId.value),
         })
       }
     })
@@ -842,10 +848,9 @@ async function connectWS() {
 
   // Токен передаём через Sec-WebSocket-Protocol, а не в query,
   // чтобы он не попадал в access-логи nginx.
-  const socket = token
-    ? new WebSocket(url, [token])
-    : new WebSocket(url)
+  const socket = token ? new WebSocket(url, [token]) : new WebSocket(url)
   ws = socket
+  wsSocket.value = socket
 
   socket.onopen = () => {
     if (generation !== wsGeneration) return
@@ -869,8 +874,7 @@ async function connectWS() {
 
         const nextTab = data.activeTab || activeTab.value
         const isEditor =
-          Boolean(data.currentEditor) &&
-          data.currentEditor.user_id === myUserId.value
+          Boolean(data.currentEditor) && data.currentEditor.user_id === myUserId.value
         editorTab.value = nextTab
         // Редактор всегда открывает свой файл, наблюдатель — только в режиме слежения.
         if (isEditor || followEditor.value) {
@@ -880,12 +884,9 @@ async function connectWS() {
         const wasMounted = Boolean(previewBrowser.value)
 
         showPreview.value = !!data.showPreview
-        previewMode.value =
-          data.previewMode === 'shared' ? 'shared' : 'individual'
+        previewMode.value = data.previewMode === 'shared' ? 'shared' : 'individual'
         remotePreviewPage.value = data.previewPage || null
-        pendingPreviewEvents = Array.isArray(data.previewEvents)
-          ? [...data.previewEvents]
-          : []
+        pendingPreviewEvents = Array.isArray(data.previewEvents) ? [...data.previewEvents] : []
         if (data.showPreview) {
           nextTick(handleWindowResize)
           nextTick(() => {
@@ -924,9 +925,7 @@ async function connectWS() {
         }
 
         // Пометки на коде и ограничения на их создание
-        annotations.value = Array.isArray(data.annotations)
-          ? data.annotations
-          : []
+        annotations.value = Array.isArray(data.annotations) ? data.annotations : []
         annotationsLocked.value = !!data.annotationsLocked
         annotationBans.value = Array.isArray(data.bannedAnnotationUserIds)
           ? data.bannedAnnotationUserIds
@@ -940,7 +939,7 @@ async function connectWS() {
             remoteSelections.value[uid] = {
               username: cursor.username,
               selection: cursor.selection,
-              color: cursor.color || getUserColor(uid)
+              color: cursor.color || getUserColor(uid),
             }
             ensureRemoteStyle(uid, remoteSelections.value[uid].color)
           }
@@ -1034,13 +1033,13 @@ async function connectWS() {
     }
 
     if (data.type === 'hand-raised') {
-      if (!raisedHands.value.find(h => h.user_id === data.user_id)) {
+      if (!raisedHands.value.find((h) => h.user_id === data.user_id)) {
         raisedHands.value.push({ user_id: data.user_id, username: data.username })
       }
     }
 
     if (data.type === 'hand-lowered') {
-      raisedHands.value = raisedHands.value.filter(h => h.user_id !== data.user_id)
+      raisedHands.value = raisedHands.value.filter((h) => h.user_id !== data.user_id)
     }
 
     // ← ИЗМЕНЕНО: предпросмотр синхронизируется у всех
@@ -1051,9 +1050,7 @@ async function connectWS() {
       remotePreviewPage.value = data.page || null
 
       if (data.show) {
-        pendingPreviewEvents = Array.isArray(data.events)
-          ? [...data.events]
-          : []
+        pendingPreviewEvents = Array.isArray(data.events) ? [...data.events] : []
 
         if (wasMounted) {
           previewBrowser.value.applyRemotePage(remotePreviewPage.value)
@@ -1073,8 +1070,7 @@ async function connectWS() {
 
     if (data.type === 'preview-mode') {
       previewMode.value = data.mode === 'shared' ? 'shared' : 'individual'
-      remotePreviewPage.value =
-        previewMode.value === 'shared' ? data.page || null : null
+      remotePreviewPage.value = previewMode.value === 'shared' ? data.page || null : null
 
       if (showPreview.value) {
         previewBrowser.value?.applyRemotePage(remotePreviewPage.value)
@@ -1129,7 +1125,7 @@ async function connectWS() {
       remoteSelections.value[data.user_id] = {
         username: data.username,
         selection: data.selection,
-        color
+        color,
       }
       ensureRemoteStyle(data.user_id, color)
       updateRemoteDecorations()
@@ -1144,7 +1140,7 @@ async function connectWS() {
     // ← НОВОЕ: пользователь вышел — чистим его курсор и руку
     if (data.type === 'user-left') {
       delete remoteSelections.value[data.user_id]
-      raisedHands.value = raisedHands.value.filter(h => h.user_id !== data.user_id)
+      raisedHands.value = raisedHands.value.filter((h) => h.user_id !== data.user_id)
       if (participantMenu.value?.participant.user_id === data.user_id) {
         closeParticipantMenu()
       }
@@ -1154,25 +1150,31 @@ async function connectWS() {
     // ===== Пометки на коде =====
     if (data.type === 'annotation-added' && data.annotation) {
       const index = annotations.value.findIndex(
-        (annotation) => annotation.id === data.annotation.id
+        (annotation) => annotation.id === data.annotation.id,
       )
 
       if (index === -1) {
         annotations.value = [...annotations.value, data.annotation]
       } else {
         annotations.value = annotations.value.map((annotation) =>
-          annotation.id === data.annotation.id ? data.annotation : annotation
+          annotation.id === data.annotation.id ? data.annotation : annotation,
         )
       }
     }
 
     if (data.type === 'annotation-removed') {
-      annotations.value = annotations.value.filter(
-        (annotation) => annotation.id !== data.id
-      )
+      annotations.value = annotations.value.filter((annotation) => annotation.id !== data.id)
       if (annotationPopup.value?.annotation.id === data.id) {
         closeAnnotationPopup()
       }
+    }
+
+    if (data.type === 'annotations-purged') {
+      annotations.value = annotations.value.filter(
+        (annotation) => annotation.user_id !== data.user_id,
+      )
+      closeAnnotationPopup()
+      cancelAnnotation()
     }
 
     if (data.type === 'annotations-cleared') {
@@ -1202,6 +1204,28 @@ async function connectWS() {
       connectionStatus.value = 'error'
       ws?.close()
       ws = null
+      wsSocket.value = null
+      return
+    }
+
+    if (data.type === 'room-deleted') {
+      // Комнату удалил ведущий: переподключаться бессмысленно.
+      shouldReconnect = false
+      connectError.value = data.reason || 'Комната удалена.'
+      connectionStatus.value = 'error'
+      ws?.close()
+      ws = null
+      wsSocket.value = null
+      return
+    }
+
+    if (data.type === 'account-deleted') {
+      shouldReconnect = false
+      connectError.value = data.reason || 'Аккаунт удалён.'
+      connectionStatus.value = 'error'
+      ws?.close()
+      ws = null
+      wsSocket.value = null
       return
     }
 
@@ -1217,6 +1241,7 @@ async function connectWS() {
     remoteSelections.value = {}
     updateRemoteDecorations()
     ws = null
+    wsSocket.value = null
 
     if (!shouldReconnect) return
 
@@ -1234,14 +1259,15 @@ async function connectWS() {
 }
 
 // 4003 — пользователя исключил ведущий (RoomSession._handle_kick_user),
-// 4401/4403/4404 отдаёт сервер (RoomSession._reject), 1008 — старый вариант.
-const PERMANENT_CLOSE_CODES = new Set([4003, 4401, 4403, 4404, 1008])
+// 4401/4403/4404/4405 отдаёт сервер, 1008 — старый вариант.
+const PERMANENT_CLOSE_CODES = new Set([4003, 4401, 4403, 4404, 4405, 1008])
 
 function describeClose(event) {
   if (event.code === 4003) return 'Ведущий исключил вас из комнаты.'
   if (event.code === 4401) return 'Не удалось подтвердить сессию. Войдите заново.'
   if (event.code === 4403) return 'Подключение с этого адреса запрещено сервером.'
   if (event.code === 4404) return 'Комната не найдена или удалена.'
+  if (event.code === 4405) return 'Аккаунт удалён.'
   return event.reason || 'Не удалось подключиться к комнате.'
 }
 
@@ -1312,7 +1338,7 @@ function send(data) {
 function getRemoteCursorPosition(selection) {
   return {
     lineNumber: selection.cursorLineNumber ?? selection.endLineNumber,
-    column: selection.cursorColumn ?? selection.endColumn
+    column: selection.cursorColumn ?? selection.endColumn,
   }
 }
 
@@ -1334,9 +1360,9 @@ function ensureRemoteCaret(uid, username, color, position) {
         if (!entry.position) return null
         return {
           position: entry.position,
-          preference: [monaco.editor.ContentWidgetPositionPreference.EXACT]
+          preference: [monaco.editor.ContentWidgetPositionPreference.EXACT],
         }
-      }
+      },
     }
 
     entry = { node, widget, position: null }
@@ -1344,8 +1370,7 @@ function ensureRemoteCaret(uid, username, color, position) {
     editor.addContentWidget(widget)
   }
 
-  const lineHeight =
-    editor.getOption(monaco.editor.EditorOption.lineHeight) || 18
+  const lineHeight = editor.getOption(monaco.editor.EditorOption.lineHeight) || 18
 
   entry.position = position
   entry.node.style.height = `${lineHeight}px`
@@ -1387,33 +1412,25 @@ function updateRemoteDecorations() {
     withCursor.add(uid)
 
     // Подсветка нужна только для непустого выделения.
-    if (
-      sel.startLineNumber !== sel.endLineNumber ||
-      sel.startColumn !== sel.endColumn
-    ) {
+    if (sel.startLineNumber !== sel.endLineNumber || sel.startColumn !== sel.endColumn) {
       newDecorations.push({
         range: new monaco.Range(
           sel.startLineNumber,
           sel.startColumn,
           sel.endLineNumber,
-          sel.endColumn
+          sel.endColumn,
         ),
         options: {
           className: `remote-selection-${uid}`,
           inlineClassName: `remote-selection-${uid}-inline`,
           hoverMessage: { value: `**${info.username}**` },
-          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
-        }
+          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+        },
       })
     }
 
     // Каретка видна всегда, даже когда выделения нет.
-    ensureRemoteCaret(
-      uid,
-      info.username,
-      info.color,
-      getRemoteCursorPosition(sel)
-    )
+    ensureRemoteCaret(uid, info.username, info.color, getRemoteCursorPosition(sel))
   }
 
   // Убираем каретки пользователей, чей курсор больше не актуален.
@@ -1450,16 +1467,15 @@ function buildAnnotationDecoration(annotation) {
       selection.startLineNumber,
       selection.startColumn,
       selection.endLineNumber,
-      selection.endColumn
+      selection.endColumn,
     ),
     options: {
       inlineClassName: `annotation-mark-${annotation.user_id}`,
       hoverMessage: {
-        value: `**${annotation.username}**\n\n${annotation.text}`
+        value: `**${annotation.username}**\n\n${annotation.text}`,
       },
-      stickiness:
-        monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges
-    }
+      stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+    },
   }
 }
 
@@ -1478,7 +1494,7 @@ function rememberAnnotationRange(id) {
     startLineNumber: range.startLineNumber,
     startColumn: range.startColumn,
     endLineNumber: range.endLineNumber,
-    endColumn: range.endColumn
+    endColumn: range.endColumn,
   })
 }
 
@@ -1492,9 +1508,7 @@ function refreshAnnotationDecorations() {
     if (!knownIds.has(id)) annotationRanges.delete(id)
   }
 
-  const visible = annotations.value.filter(
-    (annotation) => annotation.file === activeTab.value
-  )
+  const visible = annotations.value.filter((annotation) => annotation.file === activeTab.value)
   const visibleIds = new Set(visible.map((annotation) => annotation.id))
 
   for (const [id, handle] of annotationDecorationHandles) {
@@ -1507,9 +1521,7 @@ function refreshAnnotationDecorations() {
   for (const annotation of visible) {
     if (annotationDecorationHandles.has(annotation.id)) continue
 
-    const handle = editor.createDecorationsCollection([
-      buildAnnotationDecoration(annotation)
-    ])
+    const handle = editor.createDecorationsCollection([buildAnnotationDecoration(annotation)])
     annotationDecorationHandles.set(annotation.id, handle)
   }
 }
@@ -1546,7 +1558,7 @@ function annotationAt(position) {
       startLineNumber: range.startLineNumber,
       startColumn: range.startColumn,
       endLineNumber: range.endLineNumber,
-      endColumn: range.endColumn
+      endColumn: range.endColumn,
     })
 
     if (size < matchSize) {
@@ -1562,10 +1574,7 @@ function openAnnotationPopup(annotation, mouseEvent) {
   const x = mouseEvent?.clientX ?? window.innerWidth / 2
   const y = mouseEvent?.clientY ?? window.innerHeight / 2
 
-  const left = Math.max(
-    8,
-    Math.min(x, window.innerWidth - ANNOTATION_POPUP_WIDTH - 8)
-  )
+  const left = Math.max(8, Math.min(x, window.innerWidth - ANNOTATION_POPUP_WIDTH - 8))
   const below = y + 14
   const top =
     below + ANNOTATION_POPUP_HEIGHT <= window.innerHeight - 8
@@ -1579,7 +1588,7 @@ function openAnnotationPopup(annotation, mouseEvent) {
     top,
     left,
     lineStart: range?.startLineNumber,
-    lineEnd: range?.endLineNumber
+    lineEnd: range?.endLineNumber,
   }
 }
 
@@ -1625,10 +1634,7 @@ function onResize(e) {
 
   const delta = resizeStartX - e.clientX
   const maxWidth = getMaxPreviewWidth()
-  const nextWidth = Math.min(
-    Math.max(resizeStartWidth + delta, MIN_PREVIEW_WIDTH),
-    maxWidth
-  )
+  const nextWidth = Math.min(Math.max(resizeStartWidth + delta, MIN_PREVIEW_WIDTH), maxWidth)
 
   if (nextWidth !== previewWidth.value) {
     previewWidth.value = nextWidth
@@ -1678,9 +1684,7 @@ function togglePreview() {
   if (show) {
     const page =
       previewStartPage.value ||
-      (previewStartFile.value
-        ? { kind: 'file', file: previewStartFile.value }
-        : null)
+      (previewStartFile.value ? { kind: 'file', file: previewStartFile.value } : null)
     if (page) message.page = page
   }
 
@@ -1707,9 +1711,7 @@ function togglePreviewMode() {
     const page =
       previewBrowser.value?.getActivePage?.() ||
       previewStartPage.value ||
-      (previewStartFile.value
-        ? { kind: 'file', file: previewStartFile.value }
-        : null)
+      (previewStartFile.value ? { kind: 'file', file: previewStartFile.value } : null)
     if (page) message.page = page
   }
 
@@ -1739,12 +1741,12 @@ function raiseHand() {
 
 function lowerHand() {
   send({ type: 'lower-hand' })
-  raisedHands.value = raisedHands.value.filter(h => h.user_id !== myUserId.value)
+  raisedHands.value = raisedHands.value.filter((h) => h.user_id !== myUserId.value)
 }
 
 function grantEdit(userId) {
   send({ type: 'grant-edit', user_id: userId })
-  raisedHands.value = raisedHands.value.filter(h => h.user_id !== userId)
+  raisedHands.value = raisedHands.value.filter((h) => h.user_id !== userId)
 }
 
 function revokeEdit() {
@@ -1758,9 +1760,7 @@ const PARTICIPANT_MENU_WIDTH = 220
 const PARTICIPANT_MENU_HEIGHT = 150
 
 function openParticipantMenu(event, participant) {
-  if (
-    participantMenu.value?.participant.user_id === participant.user_id
-  ) {
+  if (participantMenu.value?.participant.user_id === participant.user_id) {
     closeParticipantMenu()
     return
   }
@@ -1768,10 +1768,7 @@ function openParticipantMenu(event, participant) {
   const rect = event.currentTarget.getBoundingClientRect()
   const left = Math.max(
     8,
-    Math.min(
-      rect.right - PARTICIPANT_MENU_WIDTH,
-      window.innerWidth - PARTICIPANT_MENU_WIDTH - 8
-    )
+    Math.min(rect.right - PARTICIPANT_MENU_WIDTH, window.innerWidth - PARTICIPANT_MENU_WIDTH - 8),
   )
   const below = rect.bottom + 6
   const top =
@@ -1814,15 +1811,9 @@ function openFileDialogAt(event, dialog) {
   const width = 260
   const height = dialog.mode === 'create' ? 220 : 170
 
-  const left = Math.max(
-    8,
-    Math.min(rect.left, window.innerWidth - width - 8)
-  )
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))
   const below = rect.bottom + 6
-  const top =
-    below + height <= window.innerHeight - 8
-      ? below
-      : Math.max(8, rect.top - height - 6)
+  const top = below + height <= window.innerHeight - 8 ? below : Math.max(8, rect.top - height - 6)
 
   fileDialog.value = { ...dialog, top, left }
   fileDialogError.value = ''
@@ -1915,9 +1906,9 @@ function startAnnotation() {
       startLineNumber: selection.startLineNumber,
       startColumn: selection.startColumn,
       endLineNumber: selection.endLineNumber,
-      endColumn: selection.endColumn
+      endColumn: selection.endColumn,
     },
-    excerpt: model.getValueInRange(selection).slice(0, 200)
+    excerpt: model.getValueInRange(selection).slice(0, 200),
   }
   annotationText.value = ''
 
@@ -1944,7 +1935,7 @@ function submitAnnotation() {
     type: 'annotation-add',
     file: draft.file,
     selection: draft.selection,
-    text
+    text,
   })
 
   annotationDraft.value = null
@@ -1964,7 +1955,7 @@ function revealAnnotation(annotation) {
       selection.startLineNumber,
       selection.startColumn,
       selection.endLineNumber,
-      selection.endColumn
+      selection.endColumn,
     )
 
     editor.revealRangeInCenter(range)
@@ -2016,13 +2007,15 @@ function toggleAnnotationBanFromMenu() {
   send({
     type: 'annotation-ban',
     user_id: participant.user_id,
-    banned: !annotationBans.value.includes(participant.user_id)
+    banned: !annotationBans.value.includes(participant.user_id),
   })
 }
 </script>
 
 <template>
-  <div class="room">
+  <main class="room">
+    <a class="skip-link" href="#editor">Перейти к редактору</a>
+    <a class="skip-link" href="#roomChat">Перейти к чату</a>
     <header class="room-header">
       <div class="room-identity">
         <RouterLink to="/" class="brand brand--compact">
@@ -2058,19 +2051,25 @@ function toggleAnnotationBanFromMenu() {
     </header>
 
     <div class="workspace">
-      <section class="editor-panel">
+      <section class="editor-panel" aria-label="Редактор и результат">
         <div class="editor-toolbar">
           <div class="tabs-wrap">
-            <div class="tabs">
+            <div class="tabs" role="tablist" aria-label="Файлы комнаты">
               <div
-                v-for="(_, name) in files"
+                v-for="(_, name, index) in files"
                 :key="name"
                 class="tab-group"
+                role="presentation"
               >
                 <button
                   type="button"
+                  role="tab"
+                  :aria-selected="name === activeTab"
+                  :tabindex="name === activeTab ? 0 : -1"
+                  aria-controls="editor"
                   :class="['tab', { active: name === activeTab }]"
                   @click="selectTab(name)"
+                  @keydown="onEditorTabKeydown($event, index)"
                 >
                   <span class="tab-dot" :class="fileKind(name)"></span>
                   {{ name }}
@@ -2161,7 +2160,7 @@ function toggleAnnotationBanFromMenu() {
         </div>
 
         <div ref="editorArea" class="editor-area">
-          <div id="editor" class="editor"></div>
+          <div id="editor" class="editor" tabindex="-1"></div>
 
           <div v-if="showPreview" class="resizer" @mousedown="startResize"></div>
 
@@ -2170,10 +2169,7 @@ function toggleAnnotationBanFromMenu() {
               <span class="preview-title">
                 <span class="preview-dot"></span>
                 Результат
-                <span
-                  v-if="previewMode === 'shared'"
-                  class="preview-mode-tag"
-                >
+                <span v-if="previewMode === 'shared'" class="preview-mode-tag">
                   {{ isHost ? 'общий' : 'показ ведущего' }}
                 </span>
               </span>
@@ -2197,6 +2193,7 @@ function toggleAnnotationBanFromMenu() {
                   class="icon-btn"
                   @click="togglePreview"
                   title="Закрыть"
+                  aria-label="Закрыть предпросмотр"
                 >
                   ×
                 </button>
@@ -2223,21 +2220,20 @@ function toggleAnnotationBanFromMenu() {
         </div>
       </section>
 
-      <aside class="sidebar">
+      <aside class="sidebar" aria-label="Боковая панель комнаты">
         <section class="side-card">
           <h3 class="side-title">
             Участники
             <span class="count">{{ participants.length }}</span>
           </h3>
           <ul class="participant-list">
-            <li
-              v-for="p in sortedParticipants"
-              :key="p.user_id"
-              class="participant"
-            >
+            <li v-for="p in sortedParticipants" :key="p.user_id" class="participant">
               <span
                 class="avatar"
-                :style="{ color: getUserColor(p.user_id), background: getUserColor(p.user_id) + '1f' }"
+                :style="{
+                  color: getUserColor(p.user_id),
+                  background: getUserColor(p.user_id) + '1f',
+                }"
               >
                 {{ initials(p.username) }}
               </span>
@@ -2281,9 +2277,7 @@ function toggleAnnotationBanFromMenu() {
                 data-participant-menu-trigger
                 :aria-label="`Действия участника ${p.username}`"
                 aria-haspopup="menu"
-                :aria-expanded="
-                  participantMenu?.participant.user_id === p.user_id
-                "
+                :aria-expanded="participantMenu?.participant.user_id === p.user_id"
                 @click.stop="openParticipantMenu($event, p)"
               >
                 <svg
@@ -2301,6 +2295,17 @@ function toggleAnnotationBanFromMenu() {
             </li>
           </ul>
         </section>
+
+        <ChatPanel
+          :socket="wsSocket"
+          :send="send"
+          :room-id="roomId"
+          :my-user-id="myUserId"
+          :my-username="myUsername"
+          :is-host="isHost"
+          :connection-status="connectionStatus"
+          :user-color="getUserColor"
+        />
 
         <section class="side-card">
           <h3 class="side-title">
@@ -2346,9 +2351,7 @@ function toggleAnnotationBanFromMenu() {
               {{ annotationDraft.excerpt || '…' }}
             </p>
             <div class="field">
-              <label class="label" for="annotation-text">
-                Вопрос или описание
-              </label>
+              <label class="label" for="annotation-text"> Вопрос или описание </label>
               <textarea
                 id="annotation-text"
                 ref="annotationInput"
@@ -2370,11 +2373,7 @@ function toggleAnnotationBanFromMenu() {
               >
                 Оставить
               </button>
-              <button
-                type="button"
-                class="btn btn-ghost btn-xs"
-                @click="cancelAnnotation"
-              >
+              <button type="button" class="btn btn-ghost btn-xs" @click="cancelAnnotation">
                 Отмена
               </button>
             </div>
@@ -2390,16 +2389,9 @@ function toggleAnnotationBanFromMenu() {
 
           <ul v-if="annotations.length" class="annotation-list">
             <li v-for="a in annotations" :key="a.id" class="annotation-row">
-              <button
-                type="button"
-                class="annotation-row-main"
-                @click="revealAnnotation(a)"
-              >
+              <button type="button" class="annotation-row-main" @click="revealAnnotation(a)">
                 <span class="annotation-row-meta">
-                  <span
-                    class="annotation-author"
-                    :style="{ color: getUserColor(a.user_id) }"
-                  >
+                  <span class="annotation-author" :style="{ color: getUserColor(a.user_id) }">
                     {{ a.username }}
                   </span>
                   <span class="annotation-file">{{ a.file }}</span>
@@ -2421,10 +2413,22 @@ function toggleAnnotationBanFromMenu() {
         </section>
 
         <div class="side-actions">
-          <button v-if="isHost && !canEdit" @click="revokeEdit" class="btn btn-primary">Вернуть права</button>
-          <button v-if="!isHost && hasRaisedHand" @click="lowerHand" class="btn btn-secondary">Опустить руку</button>
-          <button v-if="!isHost && !hasRaisedHand && !canEdit" @click="raiseHand" class="btn btn-secondary">Поднять руку</button>
-          <button v-if="!isHost && canEdit" @click="revokeEdit" class="btn btn-danger">Завершить редактирование</button>
+          <button v-if="isHost && !canEdit" @click="revokeEdit" class="btn btn-primary">
+            Вернуть права
+          </button>
+          <button v-if="!isHost && hasRaisedHand" @click="lowerHand" class="btn btn-secondary">
+            Опустить руку
+          </button>
+          <button
+            v-if="!isHost && !hasRaisedHand && !canEdit"
+            @click="raiseHand"
+            class="btn btn-secondary"
+          >
+            Поднять руку
+          </button>
+          <button v-if="!isHost && canEdit" @click="revokeEdit" class="btn btn-danger">
+            Завершить редактирование
+          </button>
         </div>
       </aside>
     </div>
@@ -2434,13 +2438,9 @@ function toggleAnnotationBanFromMenu() {
     <ParticipantMenu
       v-if="participantMenu"
       :participant="participantMenu.participant"
-      :is-current-editor="
-        participantMenu.participant.user_id === currentEditorId
-      "
+      :is-current-editor="participantMenu.participant.user_id === currentEditorId"
       :position="{ top: participantMenu.top, left: participantMenu.left }"
-      :annotations-banned="
-        annotationBans.includes(participantMenu.participant.user_id)
-      "
+      :annotations-banned="annotationBans.includes(participantMenu.participant.user_id)"
       @grant="grantEditFromMenu"
       @revoke="revokeEditFromMenu"
       @kick="kickUserFromMenu"
@@ -2474,28 +2474,26 @@ function toggleAnnotationBanFromMenu() {
     <div
       v-if="connectionStatus !== 'online'"
       class="room-overlay"
-      role="status"
-      aria-live="polite"
+      :role="connectionStatus === 'error' ? 'alert' : 'status'"
+      :aria-live="connectionStatus === 'error' ? 'assertive' : 'polite'"
     >
       <div class="room-overlay-card">
         <span v-if="connectionStatus !== 'error'" class="spinner" aria-hidden="true"></span>
         <p class="room-overlay-text">
-          {{ connectionStatus === 'reconnecting'
-            ? 'Соединение потеряно. Переподключаемся…'
-            : connectionStatus === 'error'
-              ? connectError
-              : 'Подключаемся к комнате…' }}
+          {{
+            connectionStatus === 'reconnecting'
+              ? 'Соединение потеряно. Переподключаемся…'
+              : connectionStatus === 'error'
+                ? connectError
+                : 'Подключаемся к комнате…'
+          }}
         </p>
-        <RouterLink
-          v-if="connectionStatus === 'error'"
-          to="/"
-          class="btn btn-ghost btn-sm"
-        >
+        <RouterLink v-if="connectionStatus === 'error'" to="/" class="btn btn-ghost btn-sm">
           На главную
         </RouterLink>
       </div>
     </div>
-  </div>
+  </main>
 </template>
 
 <style scoped>
@@ -2671,7 +2669,9 @@ function toggleAnnotationBanFromMenu() {
   font-size: 15px;
   line-height: 1;
   cursor: pointer;
-  transition: background-color 0.16s ease, color 0.16s ease;
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease;
 }
 
 .tab-remove:hover {
@@ -2693,7 +2693,9 @@ function toggleAnnotationBanFromMenu() {
   font-size: 17px;
   line-height: 1;
   cursor: pointer;
-  transition: border-color 0.16s ease, color 0.16s ease,
+  transition:
+    border-color 0.16s ease,
+    color 0.16s ease,
     background-color 0.16s ease;
 }
 
@@ -2721,7 +2723,10 @@ function toggleAnnotationBanFromMenu() {
   font-weight: 500;
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease;
 }
 
 .tab:hover {
@@ -2775,7 +2780,9 @@ function toggleAnnotationBanFromMenu() {
   border: 1px solid var(--border-strong);
   border-radius: 999px;
   background: var(--surface-3);
-  transition: background-color 0.16s ease, border-color 0.16s ease;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease;
 }
 
 .follow-switch::after {
@@ -2788,7 +2795,9 @@ function toggleAnnotationBanFromMenu() {
   border-radius: 50%;
   background: var(--text-dim);
   transform: translateY(-50%);
-  transition: transform 0.16s ease, background-color 0.16s ease;
+  transition:
+    transform 0.16s ease,
+    background-color 0.16s ease;
 }
 
 .btn.follow-toggle.is-on,
@@ -2894,7 +2903,9 @@ function toggleAnnotationBanFromMenu() {
   line-height: 1.2;
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 0.16s ease, border-color 0.16s ease,
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
     color 0.16s ease;
 }
 
@@ -2930,7 +2941,10 @@ function toggleAnnotationBanFromMenu() {
   font-size: 17px;
   line-height: 1;
   cursor: pointer;
-  transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease,
+    border-color 0.16s ease;
 }
 
 .icon-btn:hover {
@@ -3052,7 +3066,9 @@ function toggleAnnotationBanFromMenu() {
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
-  transition: background-color 0.16s ease, border-color 0.16s ease,
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
     color 0.16s ease;
 }
 
@@ -3180,6 +3196,8 @@ function toggleAnnotationBanFromMenu() {
   display: flex;
   align-items: flex-start;
   gap: 4px;
+  content-visibility: auto;
+  contain-intrinsic-size: 72px;
 }
 
 .annotation-row-main {
@@ -3195,7 +3213,9 @@ function toggleAnnotationBanFromMenu() {
   color: var(--text);
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.16s ease, background-color 0.16s ease;
+  transition:
+    border-color 0.16s ease,
+    background-color 0.16s ease;
 }
 
 .annotation-row-main:hover {
@@ -3251,7 +3271,9 @@ function toggleAnnotationBanFromMenu() {
   font-size: 16px;
   line-height: 1;
   cursor: pointer;
-  transition: background-color 0.16s ease, border-color 0.16s ease,
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
     color 0.16s ease;
 }
 

@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import api, { saveAuth, saveUser } from '@/auth'
+import api, { logout, saveAuth, saveUser } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
 import { useTheme } from '@/theme'
 import { getErrorMessages } from '@/utils/errors'
@@ -38,6 +38,11 @@ const recoveryCodes = ref([])
 const disablePassword = ref('')
 const disableCode = ref('')
 
+const exportLoading = ref(false)
+const deletePassword = ref('')
+const deleteConfirm = ref('')
+const deleteLoading = ref(false)
+
 const emailChangeToken = computed(() => String(route.query.email_change_token || ''))
 
 // ===== Разделы настроек =====
@@ -51,6 +56,11 @@ const settingsSections = [
     id: 'security',
     label: 'Безопасность',
     icon: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z',
+  },
+  {
+    id: 'data',
+    label: 'Данные',
+    icon: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3',
   },
   {
     id: 'appearance',
@@ -147,6 +157,68 @@ async function loadAccount() {
     errorMessages.value = getErrorMessages(err, 'Не удалось загрузить аккаунт')
   } finally {
     loading.value = false
+  }
+}
+
+async function downloadExport() {
+  clearMessages()
+  exportLoading.value = true
+
+  try {
+    const response = await api.get('/account/export', {
+      responseType: 'blob',
+    })
+
+    const blob = new Blob([response.data], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `peerlessons-export-${account.value?.id || 'account'}.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+
+    successMessage.value = 'Экспорт данных скачан'
+  } catch (err) {
+    errorMessages.value = getErrorMessages(
+      err,
+      'Не удалось экспортировать данные',
+    )
+  } finally {
+    exportLoading.value = false
+  }
+}
+
+async function deleteAccount() {
+  clearMessages()
+
+  if (!deletePassword.value) {
+    errorMessages.value = ['Введите пароль']
+    return
+  }
+
+  if (deleteConfirm.value.trim().toUpperCase() !== 'УДАЛИТЬ') {
+    errorMessages.value = ['Введите УДАЛИТЬ, чтобы подтвердить удаление']
+    return
+  }
+
+  deleteLoading.value = true
+
+  try {
+    await api.delete('/account', {
+      data: {
+        password: deletePassword.value,
+        confirm: deleteConfirm.value.trim(),
+      },
+    })
+
+    logout({ revoke: false })
+    router.replace({ name: 'index' })
+  } catch (err) {
+    errorMessages.value = getErrorMessages(err, 'Не удалось удалить аккаунт')
+  } finally {
+    deleteLoading.value = false
   }
 }
 
@@ -764,6 +836,96 @@ onMounted(loadAccount)
             </div>
           </section>
 
+          <section v-show="activeSection === 'data'" class="card account-card">
+            <h2 class="account-section-title">Данные и аккаунт</h2>
+            <p class="account-section-sub">
+              Экспорт персональных данных и безвозвратное удаление аккаунта.
+            </p>
+
+            <div class="account-section">
+              <h3 class="account-section-title account-section-title--small">
+                Экспорт данных
+              </h3>
+              <p class="account-section-sub">
+                Скачать JSON с профилем, созданными комнатами и сообщениями чата.
+              </p>
+              <div class="account-actions">
+                <button
+                  type="button"
+                  class="btn btn-secondary"
+                  :disabled="exportLoading"
+                  @click="downloadExport"
+                >
+                  <span v-if="exportLoading" class="spinner" aria-hidden="true"></span>
+                  {{ exportLoading ? 'Готовим файл…' : 'Скачать данные' }}
+                </button>
+              </div>
+            </div>
+
+            <div
+              class="account-section danger-zone"
+              role="group"
+              aria-labelledby="dangerZoneTitle"
+              aria-describedby="dangerZoneHint"
+            >
+              <h3
+                id="dangerZoneTitle"
+                class="account-section-title account-section-title--small"
+              >
+                Удаление аккаунта
+              </h3>
+              <p id="dangerZoneHint" class="account-section-sub">
+                Будут удалены аккаунт, созданные комнаты, сообщения и реакции.
+                Это действие необратимо.
+              </p>
+
+              <form class="auth-form" novalidate @submit.prevent="deleteAccount">
+                <div class="field">
+                  <label class="label" for="account-delete-password">Пароль</label>
+                  <input
+                    id="account-delete-password"
+                    class="input"
+                    type="password"
+                    v-model="deletePassword"
+                    autocomplete="current-password"
+                    required
+                    :disabled="deleteLoading"
+                  />
+                </div>
+                <div class="field">
+                  <label class="label" for="account-delete-confirm">
+                    Введите УДАЛИТЬ для подтверждения
+                  </label>
+                  <input
+                    id="account-delete-confirm"
+                    class="input"
+                    type="text"
+                    v-model="deleteConfirm"
+                    autocomplete="off"
+                    spellcheck="false"
+                    required
+                    :disabled="deleteLoading"
+                    placeholder="УДАЛИТЬ"
+                  />
+                </div>
+                <div class="account-actions">
+                  <button
+                    type="submit"
+                    class="btn btn-danger"
+                    :disabled="
+                      deleteLoading ||
+                      !deletePassword ||
+                      deleteConfirm.trim().toUpperCase() !== 'УДАЛИТЬ'
+                    "
+                  >
+                    <span v-if="deleteLoading" class="spinner" aria-hidden="true"></span>
+                    {{ deleteLoading ? 'Удаляем…' : 'Удалить аккаунт' }}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </section>
+
           <section v-show="activeSection === 'appearance'" class="card account-card">
             <h2 class="account-section-title">Оформление</h2>
             <p class="account-section-sub">Тема интерфейса. Выбор сохраняется в этом браузере.</p>
@@ -811,3 +973,31 @@ onMounted(loadAccount)
     </div>
   </main>
 </template>
+
+<style scoped>
+.danger-zone {
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid rgba(229, 83, 61, 0.42);
+  border-radius: 12px;
+  background: var(--danger-soft);
+}
+
+.danger-zone .account-section-title {
+  color: var(--danger-text);
+}
+
+.danger-zone .account-section-sub {
+  color: var(--danger-text-muted);
+}
+
+.danger-zone .label {
+  color: var(--danger-text-muted);
+}
+
+@media (max-width: 560px) {
+  .danger-zone {
+    padding: 12px;
+  }
+}
+</style>

@@ -474,6 +474,8 @@ watch(
   gap: 6px;
   padding: 2px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  content-visibility: auto;
+  contain-intrinsic-size: 20px;
 }
 
 .console-time {
@@ -659,6 +661,8 @@ watch(
   align-items: center;
   padding: 2px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  content-visibility: auto;
+  contain-intrinsic-size: 20px;
 }
 
 .network-method {
