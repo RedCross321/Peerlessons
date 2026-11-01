@@ -31,8 +31,13 @@ Peerlessons — self-hosted веб-приложение для совместн�
 - **Передача прав редактирования** — поднятая рука, выдача прав ведущим, возврат прав и завершение редактирования делегатом.
 - **Один редактор за раз** — сервер принимает изменения кода только от текущего редактора.
 - **Удалённые выделения и каретка** — видно, что именно выделил и где находится редактор.
+- **Чат комнаты** — история в PostgreSQL, `@упоминания`, непрочитанные, индикатор «печатает», код-блоки, реакции, закреплённые сообщения и удаление своих сообщений (ведущим — любых); свои сообщения выделены и выровнены справа.
 - **Живой предпросмотр** — встроенный мини-браузер: вкладки, адресная строка, переходы по ссылкам (`target="_blank"` открывает новую вкладку) и панель разработчика с консолью, деревом DOM и сетью.
 - **JWT-аутентификация** — access-токен на 15 минут, refresh-токен на 7 дней, автоматическое обновление и отзыв при выходе.
+- **Экспорт и удаление данных** — JSON-экспорт аккаунта и безвозвратное удаление аккаунта вместе с созданными комнатами и сообщениями.
+- **Доступность и мобильный UX** — `:focus-visible`, ARIA-роли, клавиатурная навигация по вкладкам файлов, контрастные токены, `prefers-reduced-motion` и увеличенные touch-цели.
+- **Наблюдаемость** — Sentry для backend/frontend, Prometheus-метрики, liveness/readiness и готовые алерты.
+- **Производительность** — Monaco без TS-воркера, ленивые чанки Emmet/превью/Sentry и нативная виртуализация длинных списков.
 - **Защищённые маршруты** — неавторизованный пользователь отправляется на вход и возвращается на исходный путь после него.
 - **Тёмный адаптивный интерфейс** — единая дизайн-система без градиентов и визуального шума.
 - **Понятные ошибки** — ответы FastAPI/Pydantic (включая 422) превращаются в аккуратные сообщения на русском.
@@ -190,6 +195,17 @@ npm run dev
 | `SECRET_KEY` | да | — | Подпись JWT. Не меняйте без необходимости |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | нет | `15` | Время жизни access-токена |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | нет | `7` | Время жизни refresh-токена |
+| `SENTRY_DSN` | нет | — | DSN Sentry для ошибок backend. Пусто — Sentry выключен |
+| `SENTRY_ENVIRONMENT` | нет | `production` | Окружение в Sentry |
+| `SENTRY_TRACES_SAMPLE_RATE` | нет | `0.1` | Доля запросов с трассировкой (0..1) |
+| `METRICS_ENABLED` | нет | `true` | Отдавать `/metrics` (только за доверенным прокси) |
+
+Файл `frontend/.env.local` или `.env.production`:
+
+- `VITE_SENTRY_DSN` — DSN Sentry для браузера; пусто — SDK не загружается.
+- `VITE_SENTRY_ENVIRONMENT` — окружение.
+- `VITE_SENTRY_TRACES_SAMPLE_RATE` — доля трассировок (0..1).
+- `VITE_SENTRY_RELEASE` — необязательная версия релиза.
 
 ## База данных
 
@@ -200,6 +216,9 @@ npm run dev
 - `room_participants` — модель участия (зарезервирована под расширение);
 - `code_snapshots` — модель снапшотов (зарезервирована);
 - `edit_requests` — модель запросов на редактирование (зарезервирована);
+- `chat_messages` — история сообщений чата;
+- `chat_reactions` — реакции на сообщения;
+- `chat_read_states` — курсоры прочтения чата по пользователям;
 - `refresh_tokens` — refresh-сессии с возможностью отзыва.
 
 ## API
@@ -209,13 +228,21 @@ npm run dev
 | Метод | Путь | Доступ | Описание |
 | --- | --- | --- | --- |
 | `GET` | `/health` | — | Проверка живости |
+| `GET` | `/health/live` | — | Liveness-проверка |
+| `GET` | `/health/ready` | — | Readiness: доступность PostgreSQL |
+| `GET` | `/metrics` | локальный доступ | Prometheus-метрики |
 | `POST` | `/api/auth/register` | — | Регистрация, возвращает пару токенов и пользователя |
 | `POST` | `/api/auth/login` | — | Вход по email и паролю |
 | `POST` | `/api/auth/refresh` | refresh-токен | Новый access-токен |
 | `POST` | `/api/auth/logout` | refresh-токен | Отзыв refresh-токена (204) |
 | `GET` | `/api/me` | Bearer | Текущий пользователь |
+| `GET` | `/api/account/export` | Bearer | Экспорт данных аккаунта (JSON) |
+| `DELETE` | `/api/account` | Bearer | Удалить аккаунт и связанные данные (204) |
 | `POST` | `/api/room` | Bearer | Создать комнату |
 | `GET` | `/api/room/{room_id}` | — | Получить комнату |
+| `GET` | `/api/room/{room_id}/chat` | Bearer | История чата (`before_id`, `limit`) |
+| `GET` | `/api/rooms/mine` | Bearer | Комнаты пользователя (история, новые сверху) |
+| `DELETE` | `/api/room/{room_id}` | Bearer | Удалить свою комнату (204) |
 | `WS` | `/ws/room/{room_id}?token=...` | access-токен | Комната в реальном времени |
 
 ### Аутентификация
@@ -241,8 +268,33 @@ npm run dev
 | `preview-navigate` | Показать всем другую страницу в общем режиме (только ведущий) |
 | `cursor-update` / `cursor-clear` | Позиция курсора и выделение |
 | `request-state` | Запросить полное состояние комнаты |
+| `chat-message` | Отправить сообщение в чат комнаты |
+| `chat-typing` | Индикатор набора текста |
+| `chat-reaction` | Переключить реакцию на сообщение |
+| `chat-pin` | Закрепить или открепить сообщение (только ведущий) |
+| `chat-mark-read` | Отметить сообщения прочитанными |
+| `chat-delete` | Удалить своё сообщение (ведущий — любое) |
 
-Сервер → клиент: `room-state`, `code-update`, `participants`, `editor-changed`, `hand-raised`, `hand-lowered`, `preview-toggle`, `preview-refresh`, `preview-mode`, `preview-navigate`, `preview-interaction`, `cursor-update`, `cursor-clear`, `user-left`.
+Сервер → клиент: `room-state`, `code-update`, `participants`, `editor-changed`, `hand-raised`, `hand-lowered`, `preview-toggle`, `preview-refresh`, `preview-mode`, `preview-navigate`, `preview-interaction`, `cursor-update`, `cursor-clear`, `user-left`, `room-deleted`, `chat-message`, `chat-typing`, `chat-reaction`, `chat-pinned`, `chat-deleted`, `chat-reset`, `account-deleted`, `annotations-purged`.
+
+### Наблюдаемость
+
+- `/health` и `/health/live` — процесс жив.
+- `/health/ready` — выполняет `SELECT 1`; при недоступной БД возвращает `503` и выставляет `peerlessons_db_up=0`.
+- `/metrics` — Prometheus-формат. В nginx доступ ограничен localhost; при необходимости добавьте IP Prometheus.
+- Метрики: `peerlessons_http_requests_total`, `peerlessons_http_request_duration_seconds`, `peerlessons_http_in_flight`, `peerlessons_ws_connections`, `peerlessons_ws_messages_total`, `peerlessons_rooms`, `peerlessons_chat_messages_total`, `peerlessons_db_up`.
+- `X-Request-ID` возвращается клиенту и привязывается к Sentry; 5xx и запросы дольше 2 c пишутся в лог.
+- Sentry: backend — `SENTRY_DSN`; frontend — `VITE_SENTRY_DSN`. Без DSN фронтенд-SDK не загружается.
+- Готовые алерты: `deploy/prometheus-alerts.yml`; пример scrape — `deploy/prometheus-scrape.example.yml`.
+- При нескольких uvicorn-воркерах WS-состояние и метрики живут в каждом процессе отдельно; для горизонтального масштабирования нужен Redis/pub-sub и общий scrape.
+
+### Производительность
+
+- Monaco собран из `editor.api` + `features/register.all` и только HTML/CSS/JS-определений. `ts.worker` (~7 МБ) и `json.worker` больше не собираются; HTML/CSS language services сохранены.
+- JS: подсветка, базовые подсказки и Emmet; семантический TypeScript-сервис отключён по умолчанию.
+- `emmet-monaco-es`, `PreviewBrowser` и Sentry загружаются отдельными чанками; Sentry — только при заданном DSN.
+- Для длинных списков (чат, пометки, комнаты, консоль/сеть DevTools) используется `content-visibility: auto` + `contain-intrinsic-size`.
+- Ориентиры текущей сборки: CodeRoom ≈ 1.26 МБ (было ≈ 1.47 МБ), `ts.worker` ~6.9 МБ больше не создаётся, Emmet ≈ 92 КБ отдельным чанком.
 
 ---
 

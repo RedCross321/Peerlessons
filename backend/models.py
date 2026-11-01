@@ -2,7 +2,15 @@ import uuid
 from datetime import datetime
 
 from database import Base
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Uuid, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    String,
+    UniqueConstraint,
+    Uuid,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -76,6 +84,18 @@ class Room(Base):
     edit_requests = relationship(
         "EditRequest", back_populates="room", cascade="all, delete-orphan"
     )
+    chat_messages = relationship(
+        "ChatMessage",
+        back_populates="room",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    chat_read_states = relationship(
+        "ChatReadState",
+        back_populates="room",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class RoomParticipant(Base):
@@ -140,6 +160,90 @@ class EditRequest(Base):
     )
 
     room = relationship("Room", back_populates="edit_requests")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    room_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("rooms.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    # Имя фиксируем на момент отправки: история не меняется при смене ника.
+    username: Mapped[str] = mapped_column(String(50), nullable=False)
+    text: Mapped[str] = mapped_column(String(1000), nullable=False)
+    mentions: Mapped[list[int]] = mapped_column(JSONB, default=list, nullable=False)
+
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pinned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    pinned_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    room = relationship("Room", back_populates="chat_messages")
+    reactions = relationship(
+        "ChatReaction",
+        back_populates="message",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ChatReaction(Base):
+    __tablename__ = "chat_reactions"
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id", "user_id", "emoji", name="uq_chat_reaction"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("chat_messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    emoji: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    message = relationship("ChatMessage", back_populates="reactions")
+
+
+class ChatReadState(Base):
+    __tablename__ = "chat_read_states"
+    __table_args__ = (
+        UniqueConstraint("room_id", "user_id", name="uq_chat_read_state"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    room_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("rooms.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True
+    )
+    last_read_id: Mapped[int | None] = mapped_column(nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    room = relationship("Room", back_populates="chat_read_states")
 
 
 class RefreshToken(Base):

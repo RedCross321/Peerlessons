@@ -74,6 +74,11 @@ class AccountRead(BaseModel):
     pending_email: str | None = None
 
 
+class AccountDeleteRequest(BaseModel):
+    password: str
+    confirm: str
+
+
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
@@ -211,3 +216,20 @@ class RoomRead(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ChatReactionRead(BaseModel):
+    emoji: str
+    count: int
+    user_ids: list[int]
+
+
+class ChatMessageRead(BaseModel):
+    id: int
+    user_id: int
+    username: str
+    text: str
+    created_at: datetime
+    pinned: bool = False
+    mentions: list[int] = Field(default_factory=list)
+    reactions: list[ChatReactionRead] = Field(default_factory=list)

@@ -1,8 +1,11 @@
 import asyncio
+import json
 import logging
 import re
+import time
 import unicodedata
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Any
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
@@ -40,14 +43,42 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from jose import JWTError, jwt
-from models import Room, TotpRecoveryCode, User, UserTOTP
+from models import (
+    ChatMessage,
+    ChatReaction,
+    ChatReadState,
+    CodeSnapshot,
+    EditRequest,
+    RefreshToken,
+    Room,
+    RoomParticipant,
+    TotpRecoveryCode,
+    User,
+    UserTOTP,
+)
+from observability import (
+    CHAT_MESSAGES,
+    DB_UP,
+    HTTP_DURATION,
+    HTTP_IN_FLIGHT,
+    HTTP_REQUESTS,
+    ROOMS,
+    WS_CONNECTIONS,
+    WS_MESSAGES,
+    init_sentry,
+    metrics_response,
+    set_request_id,
+)
 from schemas import (
+    AccountDeleteRequest,
     AccountRead,
     ChangeEmailRequest,
     ChangeEmailResponse,
     ChangePasswordRequest,
     ChangeUsernameRequest,
+    ChatMessageRead,
     ConfirmEmailChangeRequest,
     LoginResponse,
     RefreshTokenRequest,
@@ -203,6 +234,56 @@ app.add_middleware(
 DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
+init_sentry()
+
+
+@app.middleware("http")
+async def observe_http(request: Request, call_next: Any) -> Response:
+    """Метрики, request-id и структурные логи HTTP-запросов."""
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    request_id = re.sub(r"[^A-Za-z0-9_.:-]", "", request_id)[:64]
+    if not request_id:
+        request_id = uuid4().hex
+    set_request_id(request_id)
+
+    started = time.perf_counter()
+    HTTP_IN_FLIGHT.inc()
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    finally:
+        duration = time.perf_counter() - started
+        HTTP_IN_FLIGHT.dec()
+
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or "unmatched"
+        HTTP_REQUESTS.labels(request.method, path, str(status_code)).inc()
+        HTTP_DURATION.labels(request.method, path).observe(duration)
+
+        if status_code >= 500:
+            logger.error(
+                "HTTP %s %s -> %s за %.3f c (request_id=%s)",
+                request.method,
+                path,
+                status_code,
+                duration,
+                request_id,
+            )
+        elif duration > 2.0:
+            logger.warning(
+                "Медленный запрос %s %s -> %s за %.3f c (request_id=%s)",
+                request.method,
+                path,
+                status_code,
+                duration,
+                request_id,
+            )
+
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 class DebouncedSaver:
     """
@@ -258,6 +339,14 @@ class DebouncedSaver:
                 )
 
         self._tasks[room_id] = asyncio.create_task(delayed_save())
+
+    def cancel(self, room_id: str) -> None:
+        """Отменяет отложенное сохранение — комнату удаляют."""
+        task = self._tasks.pop(room_id, None)
+        if task is not None:
+            task.cancel()
+
+        self._pending_data.pop(room_id, None)
 
     async def flush(self, room_id: str) -> None:
         """
@@ -331,14 +420,18 @@ class ConnectionManager:
             }
         )
         self._ensure_state(room_id)
+        WS_CONNECTIONS.inc()
+        ROOMS.set(len(self.rooms))
 
     def disconnect(self, room_id: str, websocket: WebSocket) -> int | None:
         """Возвращает user_id отключившегося (или None)."""
         left_user_id = None
+        removed = False
         if room_id in self.rooms:
             for p in self.rooms[room_id]:
                 if p["websocket"] == websocket:
                     left_user_id = p["user_id"]
+                    removed = True
                     break
 
             self.rooms[room_id] = [
@@ -366,11 +459,16 @@ class ConnectionManager:
                 del self.rooms[room_id]
                 self.room_state.pop(room_id, None)
 
+            if removed:
+                WS_CONNECTIONS.dec()
+            ROOMS.set(len(self.rooms))
+
             # Если у пользователя осталось другое соединение (refresh/
             # вторая вкладка), не считаем его вышедшим.
             if still_connected:
                 return None
 
+        ROOMS.set(len(self.rooms))
         return left_user_id
 
     def get_participants(self, room_id: str) -> list[dict[str, Any]]:
@@ -438,12 +536,119 @@ class ConnectionManager:
                     f"в комнате {room_id}"
                 )
 
+    async def close_room(self, room_id: str, reason: str = "Комната удалена") -> None:
+        """Закрывает все соединения комнаты после её удаления из БД."""
+        connections = self.rooms.pop(room_id, [])
+        self.room_state.pop(room_id, None)
+        WS_CONNECTIONS.dec(len(connections))
+        ROOMS.set(len(self.rooms))
+
+        for p in connections:
+            try:
+                await p["websocket"].send_json(
+                    {"type": "room-deleted", "reason": reason}
+                )
+            except Exception:
+                pass
+
+            try:
+                await p["websocket"].close(code=4404, reason="Room deleted")
+            except Exception:
+                logger.debug(
+                    f"Не удалось закрыть соединение пользователя "
+                    f"{p['user_id']} в удалённой комнате {room_id}"
+                )
+
+    async def close_user_everywhere(self, user_id: int, reason: str = "") -> None:
+        """Закрывает все сокеты пользователя во всех комнатах."""
+        for room_id in list(self.rooms.keys()):
+            for p in list(self.rooms.get(room_id, [])):
+                if p["user_id"] != user_id:
+                    continue
+
+                try:
+                    await p["websocket"].send_json(
+                        {"type": "account-deleted", "reason": reason}
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    await p["websocket"].close(code=4405, reason="Account deleted")
+                except Exception:
+                    logger.debug(
+                        f"Не удалось закрыть соединение пользователя "
+                        f"{user_id} в комнате {room_id}"
+                    )
+
+    def purge_user(self, user_id: int) -> list[str]:
+        """Убирает следы пользователя из состояния комнат в памяти."""
+        affected: list[str] = []
+
+        for room_id, state in self.room_state.items():
+            annotations = state.get("annotations", [])
+            remaining = [
+                annotation
+                for annotation in annotations
+                if annotation.get("user_id") != user_id
+            ]
+            if len(remaining) != len(annotations):
+                state["annotations"] = remaining
+                affected.append(room_id)
+
+            state["cursors"].pop(str(user_id), None)
+            state["raisedHands"] = [
+                hand
+                for hand in state.get("raisedHands", [])
+                if hand.get("user_id") != user_id
+            ]
+            state.get("annotationBans", set()).discard(user_id)
+            if state.get("currentEditorId") == user_id:
+                state["currentEditorId"] = None
+
+        return affected
+
 
 manager = ConnectionManager()
+
+
+def ws_message_kind(value: Any) -> str:
+    """Низкокардинальный ярлык для метрики WebSocket-сообщений."""
+    if not isinstance(value, str):
+        return "unknown"
+    if value.startswith("chat-"):
+        return "chat"
+    if value.startswith("preview-"):
+        return "preview"
+    if value.startswith("annotation-"):
+        return "annotation"
+    if value.startswith("file-") or value == "code-update":
+        return "files"
+    if value.startswith("cursor-"):
+        return "cursor"
+    if value in {
+        "raise-hand",
+        "lower-hand",
+        "grant-edit",
+        "revoke-edit",
+        "kick-user",
+        "request-state",
+    }:
+        return value
+    return "other"
+
 
 # Ограничения на пометки, чтобы комната не могла раздуть память.
 MAX_ANNOTATION_TEXT = 600
 MAX_ANNOTATIONS_PER_ROOM = 200
+
+# Чат комнаты: история хранится в БД, здесь только ограничения.
+MAX_CHAT_TEXT = 1000
+CHAT_HISTORY_LIMIT = 50
+CHAT_PAGE_LIMIT = 100
+CHAT_PINNED_LIMIT = 10
+CHAT_REACTIONS = ["👍", "❤️", "😄", "🎉", "👀", "✅"]
+CHAT_REACTION_SET = set(CHAT_REACTIONS)
 
 # Журнал взаимодействий с общим превью и допустимые действия.
 MAX_PREVIEW_EVENTS = 300
@@ -457,16 +662,91 @@ FILE_NAME_PATTERN = re.compile(
 MAX_ROOM_FILES = 30
 
 
+def chat_reactions_map(
+    db: Session, message_ids: list[int]
+) -> dict[int, list[dict[str, Any]]]:
+    """Группирует реакции по сообщениям для ответа клиенту."""
+    if not message_ids:
+        return {}
+
+    rows = (
+        db.query(ChatReaction)
+        .filter(ChatReaction.message_id.in_(message_ids))
+        .order_by(ChatReaction.id.asc())
+        .all()
+    )
+
+    grouped: dict[int, dict[str, list[int]]] = {}
+    for row in rows:
+        grouped.setdefault(row.message_id, {}).setdefault(row.emoji, []).append(
+            row.user_id
+        )
+
+    order = {emoji: index for index, emoji in enumerate(CHAT_REACTIONS)}
+    return {
+        message_id: [
+            {
+                "emoji": emoji,
+                "count": len(user_ids),
+                "user_ids": user_ids,
+            }
+            for emoji, user_ids in sorted(
+                emojis.items(), key=lambda item: order.get(item[0], 999)
+            )
+        ]
+        for message_id, emojis in grouped.items()
+    }
+
+
+def serialize_chat_message(
+    message: ChatMessage, reactions: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    created_at = message.created_at
+    if created_at is not None and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+
+    return {
+        "id": message.id,
+        "user_id": message.user_id,
+        "username": message.username,
+        "text": message.text,
+        "created_at": created_at.isoformat() if created_at else None,
+        "pinned": bool(message.pinned),
+        "mentions": list(message.mentions or []),
+        "reactions": reactions or [],
+    }
+
+
+def chat_messages_payload(
+    db: Session, messages: list[ChatMessage]
+) -> list[dict[str, Any]]:
+    reactions = chat_reactions_map(db, [message.id for message in messages])
+    return [
+        serialize_chat_message(message, reactions.get(message.id, []))
+        for message in messages
+    ]
+
+
+def chat_pinned_payload(db: Session, room_uuid: UUID) -> list[dict[str, Any]]:
+    messages = (
+        db.query(ChatMessage)
+        .filter(
+            ChatMessage.room_id == room_uuid,
+            ChatMessage.pinned.is_(True),
+        )
+        .order_by(ChatMessage.pinned_at.desc(), ChatMessage.id.desc())
+        .limit(CHAT_PINNED_LIMIT)
+        .all()
+    )
+    return chat_messages_payload(db, messages)
+
+
 def normalize_file_name(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
 def is_valid_file_name(name: str) -> bool:
-    return (
-        bool(name)
-        and len(name) <= 64
-        and FILE_NAME_PATTERN.match(name) is not None
-    )
+    return bool(name) and len(name) <= 64 and FILE_NAME_PATTERN.match(name) is not None
 
 
 def default_file_content(name: str) -> str:
@@ -556,8 +836,42 @@ def get_websocket_user(token: str | None, db: Session) -> User:
 
 
 @app.get("/health")
-def health():
+def health() -> dict[str, Any]:
     return {"status": "ok"}
+
+
+@app.get("/health/live")
+def health_live() -> dict[str, Any]:
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready(db: DbSession) -> JSONResponse:
+    try:
+        db.execute(text("SELECT 1"))
+        DB_UP.set(1)
+        return JSONResponse({"status": "ok", "database": "ok"})
+    except Exception:
+        DB_UP.set(0)
+        logger.exception("Readiness-проверка: база данных недоступна")
+        return JSONResponse(
+            {"status": "error", "database": "unavailable"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics(db: DbSession) -> Response:
+    if not settings.metrics_enabled:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    try:
+        db.execute(text("SELECT 1"))
+        DB_UP.set(1)
+    except Exception:
+        DB_UP.set(0)
+
+    return metrics_response()
 
 
 def issue_tokens(db: Session, user: User) -> dict[str, Any]:
@@ -884,6 +1198,239 @@ def read_account(current_user: CurrentUser, db: DbSession) -> Any:
     }
 
 
+@app.get("/api/account/export", tags=["Account"])
+def export_account(current_user: CurrentUser, db: DbSession) -> Response:
+    """Выгружает персональные данные аккаунта в JSON."""
+    user = current_user
+    rooms = (
+        db.query(Room)
+        .filter(Room.host_id == user.id)
+        .order_by(Room.created_at.asc())
+        .all()
+    )
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.user_id == user.id)
+        .order_by(ChatMessage.id.asc())
+        .all()
+    )
+    reactions = (
+        db.query(ChatReaction)
+        .filter(ChatReaction.user_id == user.id)
+        .order_by(ChatReaction.id.asc())
+        .all()
+    )
+    read_states = db.query(ChatReadState).filter(ChatReadState.user_id == user.id).all()
+    participations = (
+        db.query(RoomParticipant).filter(RoomParticipant.user_id == user.id).all()
+    )
+    totp = db.query(UserTOTP).filter(UserTOTP.user_id == user.id).first()
+
+    annotations = []
+    for room_key, state in list(manager.room_state.items()):
+        for annotation in list(state.get("annotations", [])):
+            if annotation.get("user_id") != user.id:
+                continue
+            annotations.append(
+                {
+                    "room_id": room_key,
+                    "file": annotation.get("file"),
+                    "text": annotation.get("text"),
+                    "selection": annotation.get("selection"),
+                }
+            )
+
+    payload = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "profile": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "is_active": user.is_active,
+            "created_at": user.created_at,
+        },
+        "totp_enabled": bool(totp and totp.enabled),
+        "hosted_rooms": [
+            {
+                "id": room.id,
+                "title": room.title,
+                "alias": room.alias,
+                "status": room.status,
+                "language": room.language,
+                "created_at": room.created_at,
+                "current_code": room.current_code,
+            }
+            for room in rooms
+        ],
+        "chat_messages": [
+            {
+                "id": message.id,
+                "room_id": message.room_id,
+                "text": message.text,
+                "mentions": message.mentions,
+                "pinned": message.pinned,
+                "created_at": message.created_at,
+            }
+            for message in messages
+        ],
+        "chat_reactions": [
+            {
+                "message_id": reaction.message_id,
+                "emoji": reaction.emoji,
+                "created_at": reaction.created_at,
+            }
+            for reaction in reactions
+        ],
+        "chat_read_states": [
+            {
+                "room_id": state.room_id,
+                "last_read_id": state.last_read_id,
+            }
+            for state in read_states
+        ],
+        "participations": [
+            {
+                "room_id": participation.room_id,
+                "role": participation.role,
+                "joined_at": participation.joined_at,
+            }
+            for participation in participations
+        ],
+        "active_annotations": annotations,
+    }
+
+    content = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="peerlessons-export-{user.id}.json"'
+            )
+        },
+    )
+
+
+@app.delete(
+    "/api/account",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Account"],
+)
+async def delete_account(
+    payload: AccountDeleteRequest,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> Response:
+    """Удаляет аккаунт вместе с персональными данными."""
+    user = current_user
+    user_id = user.id
+
+    if not verify_password(payload.password, user.password):
+        raise HTTPException(status_code=400, detail="Неверный пароль")
+
+    if payload.confirm.strip().upper() != "УДАЛИТЬ":
+        raise HTTPException(
+            status_code=400,
+            detail="Введите УДАЛИТЬ, чтобы подтвердить удаление",
+        )
+
+    hosted_ids = [
+        row[0] for row in db.query(Room.id).filter(Room.host_id == user.id).all()
+    ]
+
+    affected_chat_rooms: set[UUID] = set()
+    for row in (
+        db.query(ChatMessage.room_id)
+        .filter(ChatMessage.user_id == user.id)
+        .distinct()
+        .all()
+    ):
+        affected_chat_rooms.add(row[0])
+    for row in (
+        db.query(ChatMessage.room_id)
+        .join(ChatReaction, ChatReaction.message_id == ChatMessage.id)
+        .filter(ChatReaction.user_id == user.id)
+        .distinct()
+        .all()
+    ):
+        affected_chat_rooms.add(row[0])
+
+    for room_id in hosted_ids:
+        debounce_saver.cancel(str(room_id))
+        try:
+            await manager.close_room(str(room_id), "Аккаунт удалён")
+        except Exception:
+            logger.exception(
+                f"Не удалось закрыть комнату {room_id} при удалении аккаунта"
+            )
+
+    await manager.close_user_everywhere(user_id, "Аккаунт удалён")
+
+    try:
+        db.query(Room).filter(Room.host_id == user.id).delete(synchronize_session=False)
+        db.query(ChatMessage).filter(ChatMessage.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        db.query(ChatReaction).filter(ChatReaction.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        db.query(ChatReadState).filter(ChatReadState.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        db.query(ChatMessage).filter(ChatMessage.pinned_by == user.id).update(
+            {ChatMessage.pinned_by: None}, synchronize_session=False
+        )
+        db.query(Room).filter(Room.current_editor_id == user.id).update(
+            {Room.current_editor_id: None}, synchronize_session=False
+        )
+        db.query(CodeSnapshot).filter(CodeSnapshot.user_id == user.id).update(
+            {CodeSnapshot.user_id: None}, synchronize_session=False
+        )
+        db.query(EditRequest).filter(EditRequest.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        db.query(RoomParticipant).filter(RoomParticipant.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        db.query(RefreshToken).filter(RefreshToken.user_id == user.id).delete(
+            synchronize_session=False
+        )
+        db.query(User).filter(User.id == user.id).delete(synchronize_session=False)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception(f"Ошибка удаления аккаунта пользователя {user.id}")
+        raise HTTPException(status_code=500, detail="Не удалось удалить аккаунт")
+
+    purged_rooms = manager.purge_user(user_id)
+    for room_id in purged_rooms:
+        await manager.broadcast(
+            room_id,
+            {"type": "annotations-purged", "user_id": user_id},
+        )
+
+    for room_uuid in affected_chat_rooms:
+        messages = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.room_id == room_uuid)
+            .order_by(ChatMessage.id.desc())
+            .limit(CHAT_HISTORY_LIMIT)
+            .all()
+        )
+        messages.reverse()
+
+        await manager.broadcast(
+            str(room_uuid),
+            {
+                "type": "chat-reset",
+                "messages": chat_messages_payload(db, messages),
+                "pinned": chat_pinned_payload(db, room_uuid),
+            },
+        )
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @app.patch("/api/account/username", response_model=UserRead, tags=["Account"])
 def change_username(
     payload: ChangeUsernameRequest,
@@ -899,9 +1446,7 @@ def change_username(
         .first()
     )
     if taken:
-        raise HTTPException(
-            status_code=400, detail="Это имя пользователя уже занято."
-        )
+        raise HTTPException(status_code=400, detail="Это имя пользователя уже занято.")
 
     current_user.username = payload.username
 
@@ -909,9 +1454,7 @@ def change_username(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(
-            status_code=400, detail="Это имя пользователя уже занято."
-        )
+        raise HTTPException(status_code=400, detail="Это имя пользователя уже занято.")
 
     db.refresh(current_user)
     return current_user
@@ -927,9 +1470,7 @@ def change_password(
         raise HTTPException(status_code=400, detail="Неверный текущий пароль")
 
     if verify_password(payload.new_password, current_user.password):
-        raise HTTPException(
-            status_code=400, detail="Новый пароль совпадает с текущим"
-        )
+        raise HTTPException(status_code=400, detail="Новый пароль совпадает с текущим")
 
     current_user.password = get_password_hash(payload.new_password)
     revoke_all_user_tokens(db, current_user.id)
@@ -965,9 +1506,7 @@ async def change_email(
         .first()
     )
     if taken:
-        raise HTTPException(
-            status_code=400, detail="Эта почта уже используется"
-        )
+        raise HTTPException(status_code=400, detail="Эта почта уже используется")
 
     if not settings.email_verification_enabled:
         current_user.email = new_email
@@ -976,9 +1515,7 @@ async def change_email(
             db.commit()
         except IntegrityError:
             db.rollback()
-            raise HTTPException(
-                status_code=400, detail="Эта почта уже используется"
-            )
+            raise HTTPException(status_code=400, detail="Эта почта уже используется")
 
         db.refresh(current_user)
         return current_user
@@ -1007,10 +1544,7 @@ async def change_email(
         db.commit()
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Отправка почты не настроена. "
-                "Обратитесь к администратору."
-            ),
+            detail=("Отправка почты не настроена. Обратитесь к администратору."),
         )
     except Exception:
         logger.exception("Не удалось отправить письмо для смены почты")
@@ -1040,9 +1574,7 @@ def confirm_email_change(
     db: DbSession,
 ) -> Any:
     try:
-        new_email = verify_email_change(
-            db, current_user, payload.code, payload.token
-        )
+        new_email = verify_email_change(db, current_user, payload.code, payload.token)
     except ValueError as error:
         db.commit()
         raise HTTPException(status_code=400, detail=str(error))
@@ -1057,9 +1589,7 @@ def confirm_email_change(
     )
     if taken:
         db.rollback()
-        raise HTTPException(
-            status_code=400, detail="Эта почта уже используется"
-        )
+        raise HTTPException(status_code=400, detail="Эта почта уже используется")
 
     current_user.email = new_email
 
@@ -1067,9 +1597,7 @@ def confirm_email_change(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(
-            status_code=400, detail="Эта почта уже используется"
-        )
+        raise HTTPException(status_code=400, detail="Эта почта уже используется")
 
     db.refresh(current_user)
     return current_user
@@ -1088,11 +1616,7 @@ def setup_totp(
     if not verify_password(payload.password, current_user.password):
         raise HTTPException(status_code=400, detail="Неверный пароль")
 
-    existing = (
-        db.query(UserTOTP)
-        .filter(UserTOTP.user_id == current_user.id)
-        .first()
-    )
+    existing = db.query(UserTOTP).filter(UserTOTP.user_id == current_user.id).first()
     if existing and existing.enabled:
         raise HTTPException(
             status_code=400,
@@ -1140,11 +1664,7 @@ def enable_totp(
     current_user: CurrentUser,
     db: DbSession,
 ) -> Any:
-    row = (
-        db.query(UserTOTP)
-        .filter(UserTOTP.user_id == current_user.id)
-        .first()
-    )
+    row = db.query(UserTOTP).filter(UserTOTP.user_id == current_user.id).first()
     if row is None or row.enabled:
         raise HTTPException(
             status_code=400,
@@ -1178,11 +1698,7 @@ def disable_totp(
     if not verify_password(payload.password, current_user.password):
         raise HTTPException(status_code=400, detail="Неверный пароль")
 
-    row = (
-        db.query(UserTOTP)
-        .filter(UserTOTP.user_id == current_user.id)
-        .first()
-    )
+    row = db.query(UserTOTP).filter(UserTOTP.user_id == current_user.id).first()
     if row is None or not row.enabled:
         raise HTTPException(
             status_code=400,
@@ -1231,20 +1747,46 @@ _RESERVED_ROOM_ALIASES = frozenset(
 )
 
 _TRANSLIT_RU = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
-    "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k",
-    "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
-    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
-    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y",
-    "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "y",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "h",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "sch",
+    "ъ": "",
+    "ы": "y",
+    "ь": "",
+    "э": "e",
+    "ю": "yu",
+    "я": "ya",
 }
 
 
 def slugify_room_alias(value: str) -> str:
     """Приводит псевдоним к виду, пригодному для URL."""
     text = "".join(
-        _TRANSLIT_RU.get(char, char)
-        for char in (value or "").strip().lower()
+        _TRANSLIT_RU.get(char, char) for char in (value or "").strip().lower()
     )
     # Ünïcode -> unicode: снимаем диакритику у латиницы.
     text = unicodedata.normalize("NFKD", text)
@@ -1345,11 +1887,7 @@ def get_room_by_alias(
 
     Авторизация обязательна, иначе псевдонимы можно перебирать анонимно.
     """
-    room = (
-        db.query(Room)
-        .filter(Room.alias == slugify_room_alias(alias))
-        .first()
-    )
+    room = db.query(Room).filter(Room.alias == slugify_room_alias(alias)).first()
     if room is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1364,6 +1902,86 @@ def get_room(room_id: UUID, db: DbSession) -> Room:
     if not room:
         raise HTTPException(status_code=404, detail="Комната не найдена")
     return room
+
+
+@app.get(
+    "/api/room/{room_id}/chat",
+    response_model=list[ChatMessageRead],
+    tags=["Room"],
+)
+def get_room_chat(
+    room_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+    before_id: int | None = None,
+    limit: int = CHAT_HISTORY_LIMIT,
+) -> list[ChatMessageRead]:
+    """История чата комнаты: страницами от новых к старым."""
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if room is None:
+        raise HTTPException(status_code=404, detail="Комната не найдена")
+
+    page_size = max(1, min(limit, CHAT_PAGE_LIMIT))
+    query = db.query(ChatMessage).filter(ChatMessage.room_id == room_id)
+    if before_id is not None:
+        query = query.filter(ChatMessage.id < before_id)
+
+    messages = query.order_by(ChatMessage.id.desc()).limit(page_size).all()
+    messages.reverse()
+
+    reactions = chat_reactions_map(db, [message.id for message in messages])
+    return [
+        serialize_chat_message(message, reactions.get(message.id, []))
+        for message in messages
+    ]
+
+
+@app.get("/api/rooms/mine", response_model=list[RoomRead], tags=["Room"])
+def get_my_rooms(db: DbSession, current_user: CurrentUser) -> list[Room]:
+    """История комнат пользователя: только свои, новые сверху."""
+    return (
+        db.query(Room)
+        .filter(Room.host_id == current_user.id)
+        .order_by(Room.created_at.desc())
+        .limit(100)
+        .all()
+    )
+
+
+@app.delete(
+    "/api/room/{room_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Room"],
+)
+async def delete_room(
+    room_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> Response:
+    """Удаляет комнату её создателя и закрывает живые соединения."""
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if room is None:
+        raise HTTPException(status_code=404, detail="Комната не найдена")
+
+    if room.host_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Удалить комнату может только её ведущий",
+        )
+
+    # Отложенное сохранение не должно попасть в уже удалённую строку.
+    debounce_saver.cancel(str(room_id))
+
+    db.delete(room)
+    db.commit()
+
+    # Уведомление соединений не отменяет уже выполненное удаление.
+    try:
+        await manager.close_room(str(room_id))
+    except Exception:
+        logger.exception(f"Ошибка закрытия соединений удалённой комнаты {room_id}")
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 class RoomSession:
@@ -1441,9 +2059,7 @@ class RoomSession:
 
         token = self.websocket.query_params.get("token")
         if not token:
-            protocols = self.websocket.headers.get(
-                "sec-websocket-protocol", ""
-            )
+            protocols = self.websocket.headers.get("sec-websocket-protocol", "")
             token = protocols.split(",")[0].strip() or None
 
         try:
@@ -1458,8 +2074,7 @@ class RoomSession:
         self.room = self._lookup_room()
         if not self.room:
             logger.warning(
-                f"WebSocket: комната {self.room_id} не найдена "
-                f"(user_id={self.user.id})"
+                f"WebSocket: комната {self.room_id} не найдена (user_id={self.user.id})"
             )
             return await self._reject(4404, "Room not found")
 
@@ -1500,9 +2115,7 @@ class RoomSession:
             await self.websocket.close(code=code, reason=reason)
         except Exception:
             # Клиент уже отключился — отказ отправлять некуда.
-            logger.debug(
-                f"Не удалось отправить отказ {code} в комнату {self.room_id}"
-            )
+            logger.debug(f"Не удалось отправить отказ {code} в комнату {self.room_id}")
         return False
 
     async def _join(self) -> None:
@@ -1535,6 +2148,8 @@ class RoomSession:
             await self._dispatch(data)
 
     async def _dispatch(self, data: dict[str, Any]) -> None:
+        WS_MESSAGES.labels(ws_message_kind(data.get("type"))).inc()
+
         match data.get("type"):
             case "code-update":
                 await self._handle_code_update(data)
@@ -1562,6 +2177,18 @@ class RoomSession:
                 await self._handle_annotation_ban(data)
             case "annotation-lock":
                 await self._handle_annotation_lock(data)
+            case "chat-message":
+                await self._handle_chat_message(data)
+            case "chat-typing":
+                await self._handle_chat_typing(data)
+            case "chat-reaction":
+                await self._handle_chat_reaction(data)
+            case "chat-pin":
+                await self._handle_chat_pin(data)
+            case "chat-mark-read":
+                await self._handle_chat_mark_read(data)
+            case "chat-delete":
+                await self._handle_chat_delete(data)
             case "preview-mode":
                 await self._handle_preview_mode(data)
             case "preview-navigate":
@@ -1599,9 +2226,7 @@ class RoomSession:
         if not isinstance(incoming_files, dict):
             return
 
-        current_code = (
-            room.current_code if isinstance(room.current_code, dict) else {}
-        )
+        current_code = room.current_code if isinstance(room.current_code, dict) else {}
         current_files = current_code.get("files")
         if not isinstance(current_files, dict):
             current_files = {}
@@ -1656,9 +2281,7 @@ class RoomSession:
 
     async def _send_file_error(self, reason: str) -> None:
         try:
-            await self.websocket.send_json(
-                {"type": "file-error", "reason": reason}
-            )
+            await self.websocket.send_json({"type": "file-error", "reason": reason})
         except Exception:
             pass
 
@@ -1733,11 +2356,7 @@ class RoomSession:
 
         active_tab = safe_code.get("activeTab")
         if not isinstance(active_tab, str) or active_tab not in files:
-            active_tab = (
-                "index.html"
-                if "index.html" in files
-                else next(iter(files))
-            )
+            active_tab = "index.html" if "index.html" in files else next(iter(files))
 
         new_code = {"files": files, "activeTab": active_tab}
         room.current_code = new_code
@@ -2093,6 +2712,356 @@ class RoomSession:
 
         await manager.broadcast(self.room_id, message)
 
+    def _ensure_chat_read_state(self) -> ChatReadState | None:
+        room_uuid = self.current_room.id
+        state = (
+            self.db.query(ChatReadState)
+            .filter(
+                ChatReadState.room_id == room_uuid,
+                ChatReadState.user_id == self.user_id,
+            )
+            .first()
+        )
+        if state is not None:
+            return state
+
+        latest = (
+            self.db.query(ChatMessage.id)
+            .filter(ChatMessage.room_id == room_uuid)
+            .order_by(ChatMessage.id.desc())
+            .first()
+        )
+        state = ChatReadState(
+            room_id=room_uuid,
+            user_id=self.user_id,
+            last_read_id=latest[0] if latest else 0,
+        )
+
+        try:
+            self.db.add(state)
+            self.db.commit()
+            self.db.refresh(state)
+        except IntegrityError:
+            # Параллельная вкладка уже создала состояние — перечитываем.
+            self.db.rollback()
+            return (
+                self.db.query(ChatReadState)
+                .filter(
+                    ChatReadState.room_id == room_uuid,
+                    ChatReadState.user_id == self.user_id,
+                )
+                .first()
+            )
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(
+                f"Не удалось создать состояние чтения чата для комнаты {self.room_id}"
+            )
+            return None
+
+        return state
+
+    def _set_chat_read(self, message_id: int | None) -> None:
+        if message_id is None:
+            return
+
+        state = self._ensure_chat_read_state()
+        if state is None:
+            return
+        if state.last_read_id is not None and message_id <= state.last_read_id:
+            return
+
+        state.last_read_id = message_id
+        try:
+            self.db.commit()
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(
+                f"Не удалось обновить состояние чтения чата для комнаты {self.room_id}"
+            )
+
+    def _chat_unread_counts(
+        self, room_uuid: UUID, state: ChatReadState | None
+    ) -> tuple[int, int]:
+        if state is None:
+            return 0, 0
+
+        last_read = state.last_read_id or 0
+        base = self.db.query(ChatMessage).filter(
+            ChatMessage.room_id == room_uuid,
+            ChatMessage.id > last_read,
+            ChatMessage.user_id != self.user_id,
+        )
+        unread = base.count()
+        mentions = base.filter(ChatMessage.mentions.contains([self.user_id])).count()
+        return unread, mentions
+
+    def _chat_state_payload(self) -> dict[str, Any]:
+        room_uuid = self.current_room.id
+        state = self._ensure_chat_read_state()
+
+        messages = (
+            self.db.query(ChatMessage)
+            .filter(ChatMessage.room_id == room_uuid)
+            .order_by(ChatMessage.id.desc())
+            .limit(CHAT_HISTORY_LIMIT)
+            .all()
+        )
+        messages.reverse()
+
+        has_more = False
+        if messages:
+            has_more = (
+                self.db.query(ChatMessage.id)
+                .filter(
+                    ChatMessage.room_id == room_uuid,
+                    ChatMessage.id < messages[0].id,
+                )
+                .first()
+                is not None
+            )
+
+        unread, mentions = self._chat_unread_counts(room_uuid, state)
+
+        return {
+            "chatMessages": chat_messages_payload(self.db, messages),
+            "chatPinned": chat_pinned_payload(self.db, room_uuid),
+            "chatUnreadCount": unread,
+            "chatMentionCount": mentions,
+            "chatHasMore": has_more,
+        }
+
+    async def _handle_chat_message(self, data: dict[str, Any]) -> None:
+        text = data.get("text")
+        if not isinstance(text, str):
+            return
+
+        text = text.strip()
+        if not text:
+            return
+        text = text[:MAX_CHAT_TEXT]
+
+        mentioned_ids: list[int] = []
+        mention_names = set(re.findall(r"@([A-Za-z0-9_]+)", text))
+        if mention_names:
+            rows = self.db.query(User.id).filter(User.username.in_(mention_names)).all()
+            mentioned_ids = [row[0] for row in rows if row[0] != self.user_id]
+
+        message = ChatMessage(
+            room_id=self.current_room.id,
+            user_id=self.user_id,
+            username=self.username,
+            text=text,
+            mentions=mentioned_ids,
+        )
+
+        try:
+            self.db.add(message)
+            self.db.commit()
+            self.db.refresh(message)
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(
+                f"Не удалось сохранить сообщение чата в комнате {self.room_id}"
+            )
+            return
+
+        CHAT_MESSAGES.inc()
+        payload = serialize_chat_message(message)
+        self._set_chat_read(message.id)
+
+        # Отправитель перестал печатать.
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "chat-typing",
+                "user_id": self.user_id,
+                "username": self.username,
+                "typing": False,
+            },
+            exclude=self.websocket,
+        )
+
+        await manager.broadcast(
+            self.room_id,
+            {"type": "chat-message", "message": payload},
+        )
+
+    async def _handle_chat_typing(self, data: dict[str, Any]) -> None:
+        typing = bool(data.get("typing"))
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "chat-typing",
+                "user_id": self.user_id,
+                "username": self.username,
+                "typing": typing,
+            },
+            exclude=self.websocket,
+        )
+
+    async def _handle_chat_reaction(self, data: dict[str, Any]) -> None:
+        try:
+            message_id = int(data.get("message_id"))
+        except (TypeError, ValueError):
+            return
+
+        emoji = data.get("emoji")
+        if not isinstance(emoji, str) or emoji not in CHAT_REACTION_SET:
+            return
+
+        room_uuid = self.current_room.id
+        message = (
+            self.db.query(ChatMessage)
+            .filter(
+                ChatMessage.id == message_id,
+                ChatMessage.room_id == room_uuid,
+            )
+            .first()
+        )
+        if message is None:
+            return
+
+        existing = (
+            self.db.query(ChatReaction)
+            .filter(
+                ChatReaction.message_id == message_id,
+                ChatReaction.user_id == self.user_id,
+                ChatReaction.emoji == emoji,
+            )
+            .first()
+        )
+
+        try:
+            if existing is not None:
+                self.db.delete(existing)
+            else:
+                self.db.add(
+                    ChatReaction(
+                        message_id=message_id,
+                        user_id=self.user_id,
+                        emoji=emoji,
+                    )
+                )
+            self.db.commit()
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(f"Не удалось переключить реакцию в комнате {self.room_id}")
+            return
+
+        reactions = chat_reactions_map(self.db, [message_id])
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "chat-reaction",
+                "message_id": message_id,
+                "reactions": reactions.get(message_id, []),
+            },
+        )
+
+    async def _handle_chat_pin(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        try:
+            message_id = int(data.get("message_id"))
+        except (TypeError, ValueError):
+            return
+
+        room_uuid = self.current_room.id
+        message = (
+            self.db.query(ChatMessage)
+            .filter(
+                ChatMessage.id == message_id,
+                ChatMessage.room_id == room_uuid,
+            )
+            .first()
+        )
+        if message is None:
+            return
+
+        pinned = bool(data.get("pinned"))
+        message.pinned = pinned
+        message.pinned_at = datetime.now(timezone.utc) if pinned else None
+        message.pinned_by = self.user_id if pinned else None
+
+        try:
+            self.db.commit()
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(f"Не удалось закрепить сообщение в комнате {self.room_id}")
+            return
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "chat-pinned",
+                "pinned": chat_pinned_payload(self.db, room_uuid),
+            },
+        )
+
+    async def _handle_chat_mark_read(self, data: dict[str, Any]) -> None:
+        try:
+            message_id = int(data.get("message_id"))
+        except (TypeError, ValueError):
+            message_id = None
+
+        if message_id is not None:
+            exists = (
+                self.db.query(ChatMessage.id)
+                .filter(
+                    ChatMessage.id == message_id,
+                    ChatMessage.room_id == self.current_room.id,
+                )
+                .first()
+            )
+            if exists is None:
+                return
+
+        self._set_chat_read(message_id)
+
+    async def _handle_chat_delete(self, data: dict[str, Any]) -> None:
+        try:
+            message_id = int(data.get("message_id"))
+        except (TypeError, ValueError):
+            return
+
+        room_uuid = self.current_room.id
+        message = (
+            self.db.query(ChatMessage)
+            .filter(
+                ChatMessage.id == message_id,
+                ChatMessage.room_id == room_uuid,
+            )
+            .first()
+        )
+        if message is None:
+            return
+
+        is_author = message.user_id == self.user_id
+        is_host = self.current_room.host_id == self.user_id
+        if not is_author and not is_host:
+            return
+
+        try:
+            self.db.delete(message)
+            self.db.commit()
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(
+                f"Не удалось удалить сообщение чата в комнате {self.room_id}"
+            )
+            return
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "chat-deleted",
+                "message_id": message_id,
+                "pinned": chat_pinned_payload(self.db, room_uuid),
+            },
+        )
+
     def _normalize_preview_page(self, page: Any) -> dict[str, Any] | None:
         """Проверяет страницу, которую клиент просит показать всем."""
         if not isinstance(page, dict):
@@ -2235,10 +3204,7 @@ class RoomSession:
 
     async def _handle_preview_toggle(self, data: dict[str, Any]) -> None:
         # Окном результата управляют текущий редактор и ведущий.
-        if not (
-            self._is_current_editor()
-            or self.current_room.host_id == self.user_id
-        ):
+        if not (self._is_current_editor() or self.current_room.host_id == self.user_id):
             return
 
         show = bool(data.get("show", False))
@@ -2255,9 +3221,7 @@ class RoomSession:
                 if page is not None:
                     self.state["previewPage"] = page
                 message["page"] = page
-                message["events"] = list(
-                    self.state.get("previewEvents", [])
-                )
+                message["events"] = list(self.state.get("previewEvents", []))
 
         # Отправитель тоже должен получить журнал взаимодействий.
         await manager.broadcast(self.room_id, message)
@@ -2317,6 +3281,19 @@ class RoomSession:
         current_editor_id = self.state.get("currentEditorId")
         participants = manager.get_participants(self.room_id)
 
+        try:
+            chat_payload = self._chat_state_payload()
+        except SQLAlchemyError:
+            self.db.rollback()
+            logger.exception(f"Не удалось загрузить чат комнаты {self.room_id}")
+            chat_payload = {
+                "chatMessages": [],
+                "chatPinned": [],
+                "chatUnreadCount": 0,
+                "chatMentionCount": 0,
+                "chatHasMore": False,
+            }
+
         await self.websocket.send_json(
             {
                 "type": "room-state",
@@ -2343,9 +3320,8 @@ class RoomSession:
                 "participantsVersion": self.state["participantsVersion"],
                 "raisedHands": self.state["raisedHands"],
                 "annotations": self.state.get("annotations", []),
-                "annotationsLocked": bool(
-                    self.state.get("annotationsLocked", False)
-                ),
+                **chat_payload,
+                "annotationsLocked": bool(self.state.get("annotationsLocked", False)),
                 "bannedAnnotationUserIds": sorted(
                     self.state.get("annotationBans", set())
                 ),

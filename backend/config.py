@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     )
     docs_enabled: bool = False
 
+    sentry_dsn: str = ""
+    sentry_environment: str = "production"
+    sentry_traces_sample_rate: float = 0.1
+
+    # Prometheus /metrics: включать только за доверенным прокси.
+    metrics_enabled: bool = True
+
     totp_encryption_key: str = ""
 
     email_verification_enabled: bool = True

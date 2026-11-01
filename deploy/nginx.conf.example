@@ -135,7 +135,29 @@ server {
     keepalive_timeout 30s;
 
     # ----- Health -----
-    location = /health {
+    # Покрывает /health, /health/live и /health/ready.
+    location ~ ^/health(/|$) {
+        limit_req zone=peer_api burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+    }
+
+    # ----- Prometheus metrics -----
+    # По умолчанию доступно только с localhost. Если Prometheus работает
+    # на другой машине — добавьте его IP в allow.
+    location = /metrics {
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+
         limit_req zone=peer_api burst=10 nodelay;
 
         proxy_pass http://127.0.0.1:8000;
@@ -294,7 +316,16 @@ server {
         try_files $uri $uri/ /index.html;
     }
 
-    location ~* \.(?:js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
+    # ----- Favicon -----
+    # Статику ниже отдаём с immutable-кэшем, но favicon нужно обновлять
+    # без ожидания 30 дней. Exact location имеет приоритет над regex.
+    location = /favicon.ico {
+        add_header Cache-Control "no-cache" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        try_files $uri =404;
+    }
+
+    location ~* \.(?:js|css|png|jpg|jpeg|gif|svg|woff2?)$ {
         add_header Cache-Control "public, max-age=2592000, immutable" always;
         include /etc/nginx/snippets/peerlessons-security-headers.conf;
 

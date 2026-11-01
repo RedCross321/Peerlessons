@@ -1,0 +1,47 @@
+groups:
+  - name: peerlessons
+    rules:
+      - alert: PeerlessonsDown
+        expr: up{job="peerlessons"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Peerlessons недоступен"
+          description: "Prometheus не может получить /metrics уже 2 минуты."
+
+      - alert: PeerlessonsDatabaseDown
+        expr: peerlessons_db_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL недоступен"
+          description: "Readiness-проверка базы данных возвращает ошибку."
+
+      - alert: PeerlessonsHigh5xxRate
+        expr: |
+          (
+            sum(rate(peerlessons_http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(peerlessons_http_requests_total[5m])), 0.001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая доля 5xx"
+          description: "Более 5% HTTP-запросов завершаются ошибкой 5xx."
+
+      - alert: PeerlessonsHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(peerlessons_http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая задержка HTTP (p95)"
+          description: "p95 задержки превышает 1.5 c на протяжении 10 минут."

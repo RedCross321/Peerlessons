@@ -1,0 +1,15 @@
+# Пример scrape-конфигурации Prometheus для Peerlessons.
+#
+# Если Prometheus работает на той же машине:
+#   metrics_path: /metrics
+#   targets: ["127.0.0.1:8000"]
+#
+# Если через nginx — добавьте IP Prometheus в allow для location = /metrics.
+scrape_configs:
+  - job_name: peerlessons
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "127.0.0.1:8000"
+        labels:
+          service: peerlessons
