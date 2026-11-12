@@ -66,7 +66,14 @@ async function create() {
 
 <template>
   <main class="page">
-    <section class="card auth-card">
+    <section
+      v-stagger="{
+        selector: '.auth-head > *, .auth-form > .field, .auth-form > .btn, .auth-form > .turnstile, .auth-form > .alert, .auth-footer',
+        step: 55,
+        delay: 80,
+      }"
+      class="card auth-card"
+    >
       <div class="auth-head">
         <RouterLink to="/" class="brand auth-brand">
           <span class="brand-mark">/</span>

@@ -18,6 +18,7 @@ import { useTheme } from '@/theme'
 import { getErrorMessages } from '@/utils/errors'
 import { pickHtmlFile } from '@/utils/previewDocument.js'
 import { setPageSeo } from '@/utils/seo'
+import { clamp, readStoredSize, startDrag, storeSize } from '@/utils/dragResize'
 
 const PreviewBrowser = defineAsyncComponent(() => import('@/components/PreviewBrowser.vue'))
 
@@ -84,6 +85,39 @@ document.querySelector("h1").addEventListener("click", () => {
 const activeTab = ref('index.html')
 const hasEditorSelection = ref(false)
 
+const fileOrder = ref([])
+const orderedFiles = computed(() => {
+  const names = Object.keys(files.value)
+  const order = fileOrder.value.filter((name) => names.includes(name))
+  const rank = { html: 0, css: 1, js: 2 }
+  const rest = names
+    .filter((name) => !order.includes(name))
+    .sort((a, b) => {
+      const ra = rank[fileKind(a)] ?? 3
+      const rb = rank[fileKind(b)] ?? 3
+      return ra - rb || a.toLowerCase().localeCompare(b.toLowerCase())
+    })
+  return [...order, ...rest]
+})
+
+const splitOpen = ref(false)
+const activePane = ref('left')
+const paneTabs = ref({ left: 'index.html', right: '' })
+const splitRatio = ref(0.5)
+const editorSplitEl = ref(null)
+const otherPane = computed(() => (activePane.value === 'left' ? 'right' : 'left'))
+const otherTab = computed(() => (splitOpen.value ? paneTabs.value[otherPane.value] : ''))
+
+const draggingTab = ref('')
+const dragOverTab = ref('')
+const dragOverSide = ref('before')
+const dropZone = ref('')
+const renamingTab = ref('')
+const renameValue = ref('')
+const tabNotice = ref('')
+let tabNoticeTimer = null
+let pendingRename = null
+
 const MAX_ROOM_FILES = 30
 const FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(html|css|js)$/i
 const filesCount = computed(() => Object.keys(files.value).length)
@@ -92,6 +126,7 @@ const editorTab = ref('index.html')
 // Наблюдатель по умолчанию следует за редактором.
 const followEditor = ref(true)
 const canEdit = ref(false)
+const canReorderTabs = computed(() => isHost.value || canEdit.value)
 const currentEditorName = ref(null)
 const currentEditorId = ref(null)
 const participants = ref([])
@@ -177,6 +212,11 @@ const remotePreviewPage = ref(null)
 
 const canRefreshPreview = computed(() => previewMode.value === 'individual' || isHost.value)
 const previewWidth = ref(400)
+
+const showRoomId = computed(() => {
+  const id = String(roomAlias.value || shortRoomId.value || '').trim().toLowerCase()
+  return id && id !== String(roomTitle.value || '').trim().toLowerCase()
+})
 const isResizing = ref(false)
 const editorArea = ref(null)
 const MIN_PREVIEW_WIDTH = 250
@@ -212,6 +252,8 @@ const remoteSelections = ref({})
 const remoteCaretWidgets = new Map()
 let decorationsCollection = null
 let editor = null
+const editors = { left: null, right: null }
+const decorationCollections = new Map()
 let ws = null
 const wsSocket = ref(null)
 let wsGeneration = 0
@@ -276,10 +318,10 @@ function toRemoteSelection(sel) {
 }
 
 // Применяет изменения кода минимальной правкой, не сбрасывая скролл и модель.
-function applyRemoteCode(nextValue) {
-  if (!editor) return
+function applyRemoteCode(nextValue, target = editor) {
+  if (!target) return
 
-  const model = editor.getModel()
+  const model = target.getModel()
   if (!model) return
 
   const currentValue = model.getValue()
@@ -448,6 +490,55 @@ onMounted(async () => {
   editor = monaco.editor.create(document.getElementById('editor'), {
     value: files.value[activeTab.value],
     language: getLang(activeTab.value),
+    ...buildEditorOptions(),
+  })
+  editors.left = editor
+
+  // Пересчитываем метрики после загрузки веб-шрифта: иначе Monaco
+  // может остаться на системном фолбэке.
+  document.fonts?.ready.then(() => monaco.editor.remeasureFonts())
+
+  decorationsCollection = editor.createDecorationsCollection()
+  decorationCollections.set(editor, decorationsCollection)
+  refreshAnnotationDecorations()
+
+  attachEditorListeners(editor, 'left')
+
+  await connectWS()
+})
+
+onUnmounted(() => {
+  shouldReconnect = false
+  wsGeneration += 1
+  clearTimeout(reconnectTimer)
+  clearTimeout(annotationMessageTimer)
+  clearTimeout(clearAnnotationsTimer)
+  closeAnnotationPopup()
+  disposeAnnotationDecorations()
+
+  stopResize()
+  window.removeEventListener('resize', handleWindowResize)
+  clearTimeout(inviteTimer)
+
+  // ← НОВОЕ: очищаем свой курсор при уходе
+  send({ type: 'cursor-clear' })
+  for (const uid of [...remoteCaretWidgets.keys()]) {
+    removeRemoteCaret(uid)
+  }
+  clearTimeout(tabNoticeTimer)
+  editors.right?.dispose()
+  editors.left?.dispose()
+  editors.left = null
+  editors.right = null
+  editor = null
+  decorationsCollection = null
+  ws?.close()
+  ws = null
+  wsSocket.value = null
+})
+
+function buildEditorOptions(extra = {}) {
+  return {
     theme: monacoThemeId(resolvedTheme.value),
     readOnly: true,
     automaticLayout: true,
@@ -483,19 +574,17 @@ onMounted(async () => {
     autoClosingQuotes: 'always',
     formatOnPaste: true,
     formatOnType: false,
-  })
+    ...extra,
+  }
+}
 
-  // Пересчитываем метрики после загрузки веб-шрифта: иначе Monaco
-  // может остаться на системном фолбэке.
-  document.fonts?.ready.then(() => monaco.editor.remeasureFonts())
-
-  decorationsCollection = editor.createDecorationsCollection()
-  refreshAnnotationDecorations()
+function attachEditorListeners(instance, pane) {
+  instance.onDidFocusEditorText(() => focusPane(pane))
 
   // Изменения кода
-  editor.onDidChangeModelContent(() => {
-    if (ignoreChanges || !canEdit.value) return
-    files.value[activeTab.value] = editor.getValue()
+  instance.onDidChangeModelContent(() => {
+    if (ignoreChanges || !canEdit.value || instance !== editor) return
+    files.value[activeTab.value] = instance.getValue()
     send({
       type: 'code-update',
       files: files.value,
@@ -504,24 +593,25 @@ onMounted(async () => {
   })
 
   // Курсор / выделение
-  editor.onDidChangeCursorSelection((e) => {
+  instance.onDidChangeCursorSelection((e) => {
+    if (instance !== editor) return
     hasEditorSelection.value = Boolean(e.selection && !e.selection.isEmpty())
 
     if (!canEdit.value || !ws || ws.readyState !== WebSocket.OPEN) return
-    const sel = e.selection
     send({
       type: 'cursor-update',
-      selection: toRemoteSelection(sel),
+      selection: toRemoteSelection(e.selection),
       color: getUserColor(myUserId.value),
     })
   })
 
   // Клик по подсвеченному фрагменту открывает карточку пометки.
-  editor.onMouseUp((event) => {
+  instance.onMouseUp((event) => {
+    if (instance !== editor) return
     const position = event.target.position
     if (!position) return
 
-    const selection = editor.getSelection()
+    const selection = instance.getSelection()
     if (selection && !selection.isEmpty()) return
 
     const annotation = annotationAt(position)
@@ -530,35 +620,340 @@ onMounted(async () => {
       openAnnotationPopup(annotation, mouseEvent)
     }
   })
+}
 
-  await connectWS()
-})
-
-onUnmounted(() => {
-  shouldReconnect = false
-  wsGeneration += 1
-  clearTimeout(reconnectTimer)
-  clearTimeout(annotationMessageTimer)
-  clearTimeout(clearAnnotationsTimer)
-  closeAnnotationPopup()
-  disposeAnnotationDecorations()
-
-  stopResize()
-  window.removeEventListener('resize', handleWindowResize)
-  clearTimeout(inviteTimer)
-
-  // ← НОВОЕ: очищаем свой курсор при уходе
-  send({ type: 'cursor-clear' })
-  for (const uid of [...remoteCaretWidgets.keys()]) {
-    removeRemoteCaret(uid)
+function modelForPane(pane, name) {
+  const other = pane === 'left' ? 'right' : 'left'
+  const otherEditor = splitOpen.value ? editors[other] : null
+  if (otherEditor && paneTabs.value[other] === name) {
+    const shared = otherEditor.getModel()
+    if (shared && !shared.isDisposed()) return shared
   }
-  editor?.dispose()
-  editor = null
-  decorationsCollection = null
-  ws?.close()
-  ws = null
-  wsSocket.value = null
+  return monaco.editor.createModel(files.value[name] || '', getLang(name))
+}
+
+function disposeModelIfUnused(model) {
+  if (!model || model.isDisposed()) return
+  const inUse = Object.values(editors).some((instance) => instance?.getModel() === model)
+  if (!inUse) model.dispose()
+}
+
+function setPaneFile(pane, name) {
+  const instance = editors[pane]
+  if (!instance || !name) return
+
+  if (pane === activePane.value) {
+    selectTab(name)
+    return
+  }
+
+  paneTabs.value[pane] = name
+  const oldModel = instance.getModel()
+  ignoreChanges = true
+  try {
+    instance.setModel(modelForPane(pane, name))
+  } finally {
+    ignoreChanges = false
+  }
+  disposeModelIfUnused(oldModel)
+}
+
+function syncOtherPane() {
+  if (!splitOpen.value) return
+
+  const pane = otherPane.value
+  const instance = editors[pane]
+  const name = paneTabs.value[pane]
+  if (!instance || !name) return
+
+  if (!Object.prototype.hasOwnProperty.call(files.value, name)) {
+    setPaneFile(pane, orderedFiles.value[0])
+    return
+  }
+
+  const model = instance.getModel()
+  if (!model || model === editor?.getModel()) return
+
+  applyRemoteCode(files.value[name] || '', instance)
+  const lang = getLang(name)
+  if (model.getLanguageId() !== lang) monaco.editor.setModelLanguage(model, lang)
+}
+
+function focusPane(pane) {
+  if (!splitOpen.value || pane === activePane.value) return
+  const next = editors[pane]
+  if (!next) return
+
+  closeAnnotationPopup()
+  cancelAnnotation()
+  disposeAnnotationDecorations()
+  clearRemoteDecorations()
+  if (canEdit.value) send({ type: 'cursor-clear' })
+
+  activePane.value = pane
+  editor = next
+  decorationsCollection = decorationCollections.get(next) || null
+
+  const name = paneTabs.value[pane]
+  const tabChanged = name !== activeTab.value
+  activeTab.value = name
+
+  const selection = next.getSelection()
+  hasEditorSelection.value = Boolean(selection && !selection.isEmpty())
+  if (!tabChanged) refreshAnnotationDecorations()
+
+  if (canEdit.value) {
+    editorTab.value = name
+    send({ type: 'code-update', files: files.value, activeTab: name })
+    if (selection) {
+      send({
+        type: 'cursor-update',
+        selection: toRemoteSelection(selection),
+        color: getUserColor(myUserId.value),
+      })
+    }
+  } else if (followEditor.value && name !== editorTab.value) {
+    followEditor.value = false
+  }
+
+  updateRemoteDecorations()
+}
+
+async function openSplit(name = activeTab.value) {
+  if (!editor) return
+
+  if (splitOpen.value) {
+    setPaneFile('right', name)
+    focusPane('right')
+    editors.right?.focus()
+    return
+  }
+
+  paneTabs.value.right = name
+  splitOpen.value = true
+  await nextTick()
+
+  const el = document.getElementById('editor-right')
+  if (!el) return
+
+  const instance = monaco.editor.create(el, {
+    ...buildEditorOptions({ readOnly: !canEdit.value }),
+    model: modelForPane('right', name),
+  })
+  editors.right = instance
+  decorationCollections.set(instance, instance.createDecorationsCollection())
+  attachEditorListeners(instance, 'right')
+
+  focusPane('right')
+  instance.focus()
+  handleWindowResize()
+}
+
+function closeSplit() {
+  if (!splitOpen.value) return
+
+  if (activePane.value === 'right') focusPane('left')
+
+  const instance = editors.right
+  const model = instance?.getModel()
+  instance?.dispose()
+  editors.right = null
+  if (instance) decorationCollections.delete(instance)
+  disposeModelIfUnused(model)
+
+  splitOpen.value = false
+  paneTabs.value.right = ''
+  editors.left?.layout()
+}
+
+function toggleSplit() {
+  if (splitOpen.value) closeSplit()
+  else openSplit(activeTab.value)
+}
+
+function startSplitResize(event) {
+  const container = editorSplitEl.value
+  if (!container) return
+  const width = container.getBoundingClientRect().width || 1
+  const startRatio = splitRatio.value
+  startDrag(event, {
+    axis: 'x',
+    onMove: (delta) => {
+      splitRatio.value = clamp(startRatio + delta / width, 0.2, 0.8)
+    },
+  })
+}
+
+function onTabDragStart(event, name) {
+  if (renamingTab.value) {
+    event.preventDefault()
+    return
+  }
+  draggingTab.value = name
+  event.dataTransfer.effectAllowed = 'copyMove'
+  event.dataTransfer.setData('text/plain', name)
+}
+
+function endTabDrag() {
+  draggingTab.value = ''
+  dragOverTab.value = ''
+  dropZone.value = ''
+}
+
+function onTabDragOver(event, name) {
+  if (!draggingTab.value || !canReorderTabs.value) return
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'move'
+  const rect = event.currentTarget.getBoundingClientRect()
+  dragOverTab.value = name
+  dragOverSide.value = event.clientX < rect.left + rect.width / 2 ? 'before' : 'after'
+}
+
+function moveTab(from, target, side) {
+  const order = orderedFiles.value.filter((name) => name !== from)
+  let index = order.indexOf(target)
+  if (index < 0) return
+  if (side === 'after') index += 1
+  order.splice(index, 0, from)
+  if (order.join('/') === orderedFiles.value.join('/')) return
+  fileOrder.value = order
+  send({ type: 'file-reorder', order })
+}
+
+function onTabDrop(event, name) {
+  event.preventDefault()
+  const from = draggingTab.value
+  const side = dragOverSide.value
+  endTabDrag()
+  if (!from || from === name || !canReorderTabs.value) return
+  moveTab(from, name, side)
+}
+
+function shiftTab(name, direction) {
+  if (!canReorderTabs.value) return
+  const order = orderedFiles.value
+  const index = order.indexOf(name)
+  const target = order[index + direction]
+  if (!target) return
+  moveTab(name, target, direction > 0 ? 'after' : 'before')
+  nextTick(() => {
+    const tabs = document.querySelectorAll('.tabs .tab')
+    tabs[index + direction]?.focus()
+  })
+}
+
+function editorDropZoneAt(event) {
+  const rect = event.currentTarget.getBoundingClientRect()
+  const ratio = (event.clientX - rect.left) / (rect.width || 1)
+  const border = splitOpen.value ? splitRatio.value : 0.5
+  return ratio >= border ? 'right' : 'left'
+}
+
+function onEditorDragOver(event) {
+  if (!draggingTab.value) return
+  event.dataTransfer.dropEffect = 'copy'
+  dropZone.value = editorDropZoneAt(event)
+}
+
+function onEditorDragLeave(event) {
+  if (!event.currentTarget.contains(event.relatedTarget)) dropZone.value = ''
+}
+
+function onEditorDrop(event) {
+  const name = draggingTab.value || event.dataTransfer?.getData('text/plain') || ''
+  const zone = editorDropZoneAt(event)
+  endTabDrag()
+  if (!name || !zone) return
+
+  if (zone === 'right') {
+    openSplit(name)
+  } else if (splitOpen.value) {
+    setPaneFile('left', name)
+    focusPane('left')
+    editors.left?.focus()
+  } else {
+    selectTab(name)
+  }
+}
+
+const dropHighlightStyle = computed(() => {
+  if (!dropZone.value) return null
+  const border = splitOpen.value ? splitRatio.value : 0.5
+  if (dropZone.value === 'right') {
+    return { left: border * 100 + '%', width: (1 - border) * 100 + '%' }
+  }
+  return { left: '0%', width: (splitOpen.value ? border : 1) * 100 + '%' }
 })
+
+function showTabNotice(text) {
+  tabNotice.value = text
+  clearTimeout(tabNoticeTimer)
+  tabNoticeTimer = setTimeout(() => {
+    tabNotice.value = ''
+  }, 4000)
+}
+
+function validateRename(from, to) {
+  if (!to) return 'Введите имя файла'
+  if (to.length > 64) return 'Слишком длинное имя файла'
+  if (!FILE_NAME_RE.test(to)) {
+    return 'Только латиница, цифры, точка, дефис и подчёркивание; расширение .html, .css или .js'
+  }
+  const lower = to.toLowerCase()
+  if (Object.keys(files.value).some((file) => file !== from && file.toLowerCase() === lower)) {
+    return 'Файл с таким именем уже существует'
+  }
+  return ''
+}
+
+function startRename(name) {
+  if (!isHost.value) return
+  renamingTab.value = name
+  renameValue.value = name
+  tabNotice.value = ''
+  nextTick(() => {
+    const input = document.querySelector('.tab-rename-input')
+    if (!input) return
+    input.focus()
+    const dot = name.lastIndexOf('.')
+    input.setSelectionRange(0, dot > 0 ? dot : name.length)
+  })
+}
+
+function cancelRename() {
+  renamingTab.value = ''
+}
+
+function commitRename() {
+  const from = renamingTab.value
+  if (!from) return
+  const to = renameValue.value.trim()
+  if (!to || to === from) {
+    cancelRename()
+    return
+  }
+
+  const error = validateRename(from, to)
+  if (error) {
+    showTabNotice(error)
+    return
+  }
+
+  pendingRename = { from, to }
+  send({ type: 'file-rename', from, to })
+  renamingTab.value = ''
+}
+
+function onRenameBlur() {
+  if (!renamingTab.value) return
+  const error = validateRename(renamingTab.value, renameValue.value.trim())
+  if (error && renameValue.value.trim() !== renamingTab.value) {
+    showTabNotice(error)
+    cancelRename()
+    return
+  }
+  commitRename()
+}
 
 function getLang(name) {
   const lower = String(name || '').toLowerCase()
@@ -607,11 +1002,9 @@ function switchTab(name) {
   // Декорации привязаны к модели — сбрасываем их до замены модели.
   disposeAnnotationDecorations()
 
-  const lang = getLang(name)
   const oldModel = editor.getModel()
-  const newModel = monaco.editor.createModel(files.value[name] || '', lang)
-  editor.setModel(newModel)
-  oldModel?.dispose()
+  editor.setModel(modelForPane(activePane.value, name))
+  disposeModelIfUnused(oldModel)
 
   ignoreChanges = false
 
@@ -649,8 +1042,20 @@ function selectTab(name) {
 }
 
 function onEditorTabKeydown(event, index) {
-  const names = Object.keys(files.value)
+  const names = orderedFiles.value
   if (!names.length) return
+
+  if (event.key === 'F2') {
+    event.preventDefault()
+    startRename(names[index])
+    return
+  }
+
+  if (event.altKey && event.shiftKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+    event.preventDefault()
+    shiftTab(names[index], event.key === 'ArrowRight' ? 1 : -1)
+    return
+  }
 
   let nextIndex = index
 
@@ -693,24 +1098,40 @@ function loadTabIntoEditor(name) {
   ignoreChanges = true
 
   try {
-    const model = monaco.editor.createModel(files.value[name] || '', getLang(name))
-    editor.setModel(model)
+    editor.setModel(modelForPane(activePane.value, name))
   } finally {
     ignoreChanges = false
   }
 
-  oldModel?.dispose()
+  disposeModelIfUnused(oldModel)
   hasEditorSelection.value = false
   updateRemoteDecorations()
   refreshAnnotationDecorations()
 }
 
 // Применяет изменения состава файлов от сервера (создание/удаление).
-function applyFilesUpdate(nextFiles, serverActiveTab) {
+function applyFilesUpdate(nextFiles, serverActiveTab, extra = {}) {
   if (!nextFiles || typeof nextFiles !== 'object') return
 
   const names = Object.keys(nextFiles)
   if (!names.length) return
+
+  if (Array.isArray(extra.order)) fileOrder.value = extra.order
+
+  const renamed = extra.renamed
+  if (renamed?.from && renamed?.to) {
+    const mapName = (name) => (name === renamed.from ? renamed.to : name)
+    paneTabs.value = { left: mapName(paneTabs.value.left), right: mapName(paneTabs.value.right) }
+    editorTab.value = mapName(editorTab.value)
+    activeTab.value = mapName(activeTab.value)
+    annotations.value = annotations.value.map((annotation) =>
+      annotation.file === renamed.from ? { ...annotation, file: renamed.to } : annotation,
+    )
+    if (remotePreviewPage.value?.file === renamed.from) {
+      remotePreviewPage.value = { ...remotePreviewPage.value, file: renamed.to }
+    }
+    if (pendingRename?.from === renamed.from) pendingRename = null
+  }
 
   const has = (name) => Object.prototype.hasOwnProperty.call(nextFiles, name)
   const serverTab =
@@ -738,13 +1159,15 @@ function applyFilesUpdate(nextFiles, serverActiveTab) {
     files.value[activeTab.value] = editor.getValue()
   } else {
     applyRemoteCode(files.value[activeTab.value] || '')
-
-    const model = editor.getModel()
-    const lang = getLang(activeTab.value)
-    if (model && model.getLanguageId() !== lang) {
-      monaco.editor.setModelLanguage(model, lang)
-    }
   }
+
+  const activeModel = editor?.getModel()
+  const activeLang = getLang(activeTab.value)
+  if (activeModel && activeModel.getLanguageId() !== activeLang) {
+    monaco.editor.setModelLanguage(activeModel, activeLang)
+  }
+
+  syncOtherPane()
 
   // Пометки удалённых файлов больше некуда привязать.
   const present = new Set(names)
@@ -758,7 +1181,9 @@ function applyFilesUpdate(nextFiles, serverActiveTab) {
 
 // ← ИЗМЕНЕНО: при получении/потере прав сразу шлём курсор или очищаем
 watch(canEdit, (val) => {
-  editor?.updateOptions({ readOnly: !val })
+  for (const instance of Object.values(editors)) {
+    instance?.updateOptions({ readOnly: !val })
+  }
 
   if (val && editor) {
     // Получили права → сразу сообщаем свой курсор
@@ -792,6 +1217,7 @@ watch(showPreview, (visible) => {
 // Пометки относятся к конкретному файлу — при смене вкладки
 // пересобираем декорации с нуля.
 watch(activeTab, () => {
+  paneTabs.value[activePane.value] = activeTab.value
   closeAnnotationPopup()
   cancelAnnotation()
   hasEditorSelection.value = false
@@ -871,6 +1297,8 @@ async function connectWS() {
         if (data.alias) roomAlias.value = data.alias
 
         files.value = data.files || files.value
+        if (Array.isArray(data.order)) fileOrder.value = data.order
+        const prevActiveTab = activeTab.value
 
         const nextTab = data.activeTab || activeTab.value
         const isEditor =
@@ -945,7 +1373,9 @@ async function connectWS() {
           }
         }
 
-        if (editor) {
+        if (editor && activeTab.value !== prevActiveTab) {
+          loadTabIntoEditor(activeTab.value)
+        } else if (editor) {
           const newVal = files.value[activeTab.value] || ''
           const lang = getLang(activeTab.value)
           const model = editor.getModel()
@@ -961,6 +1391,8 @@ async function connectWS() {
             }
           }
         }
+
+        syncOtherPane()
 
         // Курсоры применяем после установки модели и активной вкладки.
         updateRemoteDecorations()
@@ -981,6 +1413,7 @@ async function connectWS() {
     // Обычное обновление кода
     if (data.type === 'code-update') {
       files.value = data.files || files.value
+      if (Array.isArray(data.order)) fileOrder.value = data.order
 
       const prevActiveTab = activeTab.value
       const prevEditorTab = editorTab.value
@@ -992,7 +1425,9 @@ async function connectWS() {
         activeTab.value = nextTab
       }
 
-      if (editor) {
+      if (editor && activeTab.value !== prevActiveTab) {
+        loadTabIntoEditor(activeTab.value)
+      } else if (editor) {
         const newVal = files.value[activeTab.value] || ''
         applyRemoteCode(newVal)
 
@@ -1002,6 +1437,8 @@ async function connectWS() {
           monaco.editor.setModelLanguage(model, lang)
         }
       }
+
+      syncOtherPane()
 
       if (editorTab.value !== prevEditorTab) {
         // Редактор ушёл в другой файл — старые каретки к нему уже не относятся.
@@ -1097,8 +1534,15 @@ async function connectWS() {
       }
     }
 
+    if (data.type === 'files-order' && Array.isArray(data.order)) {
+      fileOrder.value = data.order
+    }
+
     if (data.type === 'files-update') {
-      applyFilesUpdate(data.files, data.activeTab)
+      applyFilesUpdate(data.files, data.activeTab, {
+        order: data.order,
+        renamed: data.renamed,
+      })
       if (fileDialog.value) closeFileDialog()
 
       if (pendingCreatedFile) {
@@ -1112,6 +1556,10 @@ async function connectWS() {
     }
 
     if (data.type === 'file-error') {
+      if (pendingRename) {
+        pendingRename = null
+        showTabNotice(data.reason || 'Не удалось переименовать файл.')
+      }
       pendingCreatedFile = ''
       if (fileDialog.value) {
         fileDialogError.value = data.reason || 'Не удалось изменить файлы.'
@@ -1596,6 +2044,48 @@ function closeAnnotationPopup() {
   annotationPopup.value = null
 }
 
+const SIDEBAR_WIDTH_KEY = 'peerlessons-room-sidebar-width'
+const DEFAULT_SIDEBAR_WIDTH = 288
+const MIN_SIDEBAR_WIDTH = 240
+const MAX_SIDEBAR_WIDTH = 720
+const sidebarWidth = ref(readStoredSize(SIDEBAR_WIDTH_KEY, DEFAULT_SIDEBAR_WIDTH))
+
+function getMaxSidebarWidth() {
+  const reserved = MIN_EDITOR_WIDTH + (showPreview.value ? MIN_PREVIEW_WIDTH + 6 : 0) + 6
+  return clamp(window.innerWidth - reserved, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+}
+
+function setSidebarWidth(value) {
+  const next = clamp(Math.round(value), MIN_SIDEBAR_WIDTH, getMaxSidebarWidth())
+  if (next === sidebarWidth.value) return
+  sidebarWidth.value = next
+  const maxPreview = getMaxPreviewWidth()
+  if (previewWidth.value > maxPreview) previewWidth.value = maxPreview
+  scheduleEditorLayout()
+}
+
+function startSidebarResize(event) {
+  const startWidth = sidebarWidth.value
+  startDrag(event, {
+    axis: 'x',
+    onMove: (delta) => setSidebarWidth(startWidth - delta),
+    onEnd: () => {
+      storeSize(SIDEBAR_WIDTH_KEY, sidebarWidth.value)
+      editor?.layout()
+    },
+  })
+}
+
+function onSidebarResizerKey(event) {
+  const step = event.shiftKey ? 48 : 16
+  if (event.key === 'ArrowLeft') setSidebarWidth(sidebarWidth.value + step)
+  else if (event.key === 'ArrowRight') setSidebarWidth(sidebarWidth.value - step)
+  else if (event.key === 'Home') setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)
+  else return
+  event.preventDefault()
+  storeSize(SIDEBAR_WIDTH_KEY, sidebarWidth.value)
+}
+
 // ===== Resizer =====
 function getMaxPreviewWidth() {
   const areaWidth = editorArea.value?.clientWidth || window.innerWidth
@@ -1664,6 +2154,10 @@ function stopResize() {
 
 function handleWindowResize() {
   if (window.innerWidth <= 900) return
+
+  if (sidebarWidth.value > getMaxSidebarWidth()) {
+    sidebarWidth.value = getMaxSidebarWidth()
+  }
 
   const maxWidth = getMaxPreviewWidth()
 
@@ -2016,7 +2510,7 @@ function toggleAnnotationBanFromMenu() {
   <main class="room">
     <a class="skip-link" href="#editor">Перейти к редактору</a>
     <a class="skip-link" href="#roomChat">Перейти к чату</a>
-    <header class="room-header">
+    <header v-reveal="{ y: -10, blur: 0, duration: 520 }" class="room-header">
       <div class="room-identity">
         <RouterLink to="/" class="brand brand--compact">
           <span class="brand-mark">/</span>
@@ -2025,18 +2519,21 @@ function toggleAnnotationBanFromMenu() {
         <span class="room-sep"></span>
         <div class="room-meta">
           <span class="room-title">{{ roomTitle || 'Комната' }}</span>
-          <span class="room-id">{{ roomAlias || shortRoomId }}</span>
+          <span v-if="showRoomId" class="room-id">{{ roomAlias || shortRoomId }}</span>
         </div>
       </div>
 
       <div class="room-header-right">
         <div class="room-status">
-          <span class="status-dot" :class="{ edit: canEdit }"></span>
-          <span v-if="currentEditorName" class="status-text">
-            Редактирует <b>{{ currentEditorName }}</b>
+          <span v-if="canEdit" class="badge badge-accent editor-badge">Вы редактируете</span>
+          <span
+            v-else-if="currentEditorName"
+            class="badge badge-accent editor-badge"
+            :title="`Редактирует ${currentEditorName}`"
+          >
+            Редактирует <b class="editor-badge-name">{{ currentEditorName }}</b>
           </span>
-          <span v-else class="status-text">Режим просмотра</span>
-          <span v-if="canEdit" class="badge badge-accent">Вы редактируете</span>
+          <span v-else class="badge editor-badge">Режим просмотра</span>
         </div>
 
         <button
@@ -2051,24 +2548,65 @@ function toggleAnnotationBanFromMenu() {
     </header>
 
     <div class="workspace">
-      <section class="editor-panel" aria-label="Редактор и результат">
+      <section
+        v-reveal="{ y: 16, blur: 0, delay: 80, duration: 640 }"
+        class="editor-panel"
+        aria-label="Редактор и результат"
+      >
         <div class="editor-toolbar">
           <div class="tabs-wrap">
             <div class="tabs" role="tablist" aria-label="Файлы комнаты">
               <div
-                v-for="(_, name, index) in files"
+                v-for="(name, index) in orderedFiles"
                 :key="name"
-                class="tab-group"
+                :class="[
+                  'tab-group',
+                  {
+                    'is-active': name === activeTab && renamingTab !== name,
+                    'is-dragging': draggingTab === name,
+                    'drop-before': dragOverTab === name && draggingTab !== name && dragOverSide === 'before',
+                    'drop-after': dragOverTab === name && draggingTab !== name && dragOverSide === 'after',
+                  },
+                ]"
                 role="presentation"
+                :draggable="renamingTab !== name"
+                @dragstart="onTabDragStart($event, name)"
+                @dragend="endTabDrag"
+                @dragover="onTabDragOver($event, name)"
+                @dragleave="dragOverTab === name && (dragOverTab = '')"
+                @drop="onTabDrop($event, name)"
               >
+                <span v-if="renamingTab === name" class="tab tab-renaming">
+                  <span class="tab-dot" :class="fileKind(renameValue)"></span>
+                  <input
+                    v-model="renameValue"
+                    class="tab-rename-input"
+                    type="text"
+                    maxlength="64"
+                    spellcheck="false"
+                    autocomplete="off"
+                    :aria-label="`Новое имя для ${name}`"
+                    :size="Math.max(renameValue.length, 6)"
+                    @keydown.enter.prevent="commitRename"
+                    @keydown.esc.prevent="cancelRename"
+                    @blur="onRenameBlur"
+                  />
+                </span>
                 <button
+                  v-else
                   type="button"
                   role="tab"
                   :aria-selected="name === activeTab"
                   :tabindex="name === activeTab ? 0 : -1"
                   aria-controls="editor"
-                  :class="['tab', { active: name === activeTab }]"
+                  :class="['tab', { active: name === activeTab, 'in-other-pane': name === otherTab && name !== activeTab }]"
+                  :title="
+                    isHost
+                      ? 'Двойной клик или F2 — переименовать. Перетащите, чтобы поменять порядок или открыть справа'
+                      : 'Перетащите на редактор, чтобы открыть рядом'
+                  "
                   @click="selectTab(name)"
+                  @dblclick="startRename(name)"
                   @keydown="onEditorTabKeydown($event, index)"
                 >
                   <span class="tab-dot" :class="fileKind(name)"></span>
@@ -2099,20 +2637,47 @@ function toggleAnnotationBanFromMenu() {
             >
               +
             </button>
+
+            <p v-if="tabNotice" class="tab-notice" role="alert">{{ tabNotice }}</p>
           </div>
 
           <div class="toolbar-actions">
             <button
               type="button"
-              class="btn btn-ghost btn-sm annotate-btn"
+              class="btn btn-ghost btn-sm tool-btn split-toggle"
+              :class="{ 'is-on': splitOpen }"
+              :aria-pressed="splitOpen"
+              :aria-label="splitOpen ? 'Закрыть вторую группу' : 'Разделить редактор'"
+              :title="splitOpen ? 'Закрыть вторую группу' : 'Разделить редактор: открыть файл справа'"
+              @click="toggleSplit"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M12 4v16" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm tool-btn annotate-btn"
+              aria-label="Пометка"
               :disabled="!canAnnotate || !hasEditorSelection"
               :title="annotateTitle"
               @click="startAnnotation"
             >
               <svg
                 viewBox="0 0 24 24"
-                width="15"
-                height="15"
+                width="16"
+                height="16"
                 fill="none"
                 stroke="currentColor"
                 stroke-width="1.8"
@@ -2123,44 +2688,162 @@ function toggleAnnotationBanFromMenu() {
                 <path d="M12 20h9" />
                 <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
               </svg>
-              Пометка
             </button>
             <button
               v-if="!canEdit"
               type="button"
-              class="btn btn-ghost btn-sm follow-toggle"
+              class="btn btn-ghost btn-sm tool-btn follow-toggle"
               :class="{ 'is-on': followEditor }"
               :aria-pressed="followEditor"
+              aria-label="Слежение за редактором"
               :title="
                 followEditor
-                  ? 'Вкладки автоматически переключаются за редактором'
-                  : 'Вы переключаете вкладки самостоятельно'
+                  ? 'Слежение включено: вкладки переключаются за редактором'
+                  : 'Слежение выключено: вы переключаете вкладки сами'
               "
               @click="toggleFollow"
             >
-              <span class="follow-switch" aria-hidden="true"></span>
-              Слежение
+              <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M2.06 12.35a1 1 0 0 1 0-.7 10.75 10.75 0 0 1 19.88 0 1 1 0 0 1 0 .7 10.75 10.75 0 0 1-19.88 0" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
             </button>
             <button
               v-if="canEdit || isHost"
-              class="btn btn-secondary btn-sm"
+              type="button"
+              class="btn btn-sm tool-btn run-btn"
+              :class="showPreview ? 'btn-ghost is-on' : 'btn-secondary'"
+              :aria-pressed="showPreview"
+              :aria-label="showPreview ? 'Скрыть результат' : 'Запустить код'"
+              :title="showPreview ? 'Скрыть результат' : 'Запустить код'"
               @click="togglePreview"
             >
-              {{ showPreview ? 'Скрыть результат' : 'Запустить код' }}
+              <svg
+                v-if="showPreview"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+                aria-hidden="true"
+              >
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+              <svg
+                v-else
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+                aria-hidden="true"
+              >
+                <path d="M8 5.5v13a1 1 0 0 0 1.52.85l10.4-6.5a1 1 0 0 0 0-1.7L9.52 4.65A1 1 0 0 0 8 5.5Z" />
+              </svg>
             </button>
             <button
               v-if="showPreview && canRefreshPreview"
-              class="btn btn-ghost btn-sm"
-              @click="refreshPreview"
+              type="button"
+              class="btn btn-ghost btn-sm tool-btn"
+              aria-label="Обновить предпросмотр"
               title="Обновить предпросмотр"
+              @click="refreshPreview"
             >
-              Обновить
+              <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
             </button>
           </div>
         </div>
 
         <div ref="editorArea" class="editor-area">
-          <div id="editor" class="editor" tabindex="-1"></div>
+          <div ref="editorSplitEl" class="editor-split" :class="{ 'is-split': splitOpen }">
+            <div
+              class="editor-pane"
+              :class="{ 'is-active': activePane === 'left' }"
+              :style="splitOpen ? { flex: `0 0 ${splitRatio * 100}%` } : null"
+            >
+              <div v-if="splitOpen" class="pane-header" @mousedown="focusPane('left')">
+                <span class="tab-dot" :class="fileKind(paneTabs.left)"></span>
+                <span class="pane-name">{{ paneTabs.left }}</span>
+              </div>
+              <div id="editor" class="editor" tabindex="-1"></div>
+            </div>
+
+            <template v-if="splitOpen">
+              <div
+                class="split-resizer"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Граница между группами редактора"
+                title="Потяните, чтобы изменить ширину групп. Двойной клик — поровну"
+                @pointerdown="startSplitResize"
+                @dblclick="splitRatio = 0.5"
+              ></div>
+
+              <div class="editor-pane" :class="{ 'is-active': activePane === 'right' }">
+                <div class="pane-header" @mousedown="focusPane('right')">
+                  <span class="tab-dot" :class="fileKind(paneTabs.right)"></span>
+                  <span class="pane-name">{{ paneTabs.right }}</span>
+                  <button
+                    type="button"
+                    class="pane-close"
+                    aria-label="Закрыть вторую группу"
+                    title="Закрыть вторую группу"
+                    @mousedown.stop
+                    @click.stop="closeSplit"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="13"
+                      height="13"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.2"
+                      stroke-linecap="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M6 6l12 12M18 6 6 18" />
+                    </svg>
+                  </button>
+                </div>
+                <div id="editor-right" class="editor"></div>
+              </div>
+            </template>
+
+            <div
+              v-if="draggingTab"
+              class="editor-drop-overlay"
+              @dragover.prevent="onEditorDragOver"
+              @dragleave="onEditorDragLeave"
+              @drop.prevent="onEditorDrop"
+            >
+              <div v-if="dropHighlightStyle" class="editor-drop-zone" :style="dropHighlightStyle">
+                <span class="editor-drop-label">
+                  {{ dropZone === 'right' && !splitOpen ? 'Открыть справа' : 'Открыть здесь' }}
+                </span>
+              </div>
+            </div>
+          </div>
 
           <div v-if="showPreview" class="resizer" @mousedown="startResize"></div>
 
@@ -2220,7 +2903,27 @@ function toggleAnnotationBanFromMenu() {
         </div>
       </section>
 
-      <aside class="sidebar" aria-label="Боковая панель комнаты">
+      <div
+        class="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Ширина боковой панели"
+        :aria-valuenow="sidebarWidth"
+        :aria-valuemin="MIN_SIDEBAR_WIDTH"
+        :aria-valuemax="MAX_SIDEBAR_WIDTH"
+        tabindex="0"
+        title="Потяните, чтобы изменить ширину. Двойной клик — по умолчанию"
+        @pointerdown="startSidebarResize"
+        @dblclick="setSidebarWidth(DEFAULT_SIDEBAR_WIDTH); storeSize(SIDEBAR_WIDTH_KEY, DEFAULT_SIDEBAR_WIDTH)"
+        @keydown="onSidebarResizerKey"
+      ></div>
+
+      <aside
+        v-stagger="{ y: 14, blur: 0, step: 70, delay: 160, duration: 600 }"
+        class="sidebar"
+        :style="{ '--sidebar-width': sidebarWidth + 'px' }"
+        aria-label="Боковая панель комнаты"
+      >
         <section class="side-card">
           <h3 class="side-title">
             Участники
@@ -2477,7 +3180,7 @@ function toggleAnnotationBanFromMenu() {
       :role="connectionStatus === 'error' ? 'alert' : 'status'"
       :aria-live="connectionStatus === 'error' ? 'assertive' : 'polite'"
     >
-      <div class="room-overlay-card">
+      <div v-reveal="{ y: 8, scale: 0.96, blur: 0, duration: 480 }" class="room-overlay-card">
         <span v-if="connectionStatus !== 'error'" class="spinner" aria-hidden="true"></span>
         <p class="room-overlay-text">
           {{
@@ -2576,30 +3279,16 @@ function toggleAnnotationBanFromMenu() {
   min-width: 0;
 }
 
-.status-dot {
-  width: 7px;
-  height: 7px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--text-dim);
-}
-
-.status-dot.edit {
-  background: var(--accent);
-  box-shadow: 0 0 0 4px var(--accent-soft);
-}
-
-.status-text {
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 13px;
+.editor-badge {
+  max-width: 260px;
+  min-width: 0;
   white-space: nowrap;
-  text-overflow: ellipsis;
 }
 
-.status-text b {
-  color: var(--text);
-  font-weight: 600;
+.editor-badge-name {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
 }
 
 .workspace {
@@ -2628,6 +3317,7 @@ function toggleAnnotationBanFromMenu() {
 }
 
 .tabs-wrap {
+  position: relative;
   display: flex;
   flex: 1;
   align-items: center;
@@ -2649,10 +3339,90 @@ function toggleAnnotationBanFromMenu() {
 }
 
 .tab-group {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 2px;
   flex: none;
+}
+
+.tab-group.is-active {
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.tab-group.is-active .tab {
+  border-color: transparent;
+  background: transparent;
+}
+
+.tab-group.is-active .tab-remove {
+  margin-right: 3px;
+  margin-left: -6px;
+}
+
+.tab-group.is-dragging {
+  opacity: 0.45;
+}
+
+.tab-group.drop-before::before,
+.tab-group.drop-after::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.tab-group.drop-before::before {
+  left: -4px;
+}
+
+.tab-group.drop-after::after {
+  right: -4px;
+}
+
+.tab.in-other-pane {
+  border-color: var(--border);
+  border-style: dashed;
+  color: var(--text);
+}
+
+.tab-renaming {
+  padding: 4px 8px;
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+
+.tab-rename-input {
+  min-width: 0;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 4px;
+  outline: none;
+  background: var(--input-focus-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.tab-notice {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  max-width: 420px;
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(229, 83, 61, 0.35);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--danger-text);
+  font-size: 12.5px;
+  box-shadow: var(--shadow);
 }
 
 .tab-remove {
@@ -2767,6 +3537,20 @@ function toggleAnnotationBanFromMenu() {
   flex-shrink: 0;
 }
 
+.btn.tool-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  gap: 0;
+}
+
+.btn.tool-btn.follow-toggle.is-on,
+.btn.tool-btn.run-btn.is-on {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .follow-toggle {
   flex: none;
   gap: 9px;
@@ -2827,6 +3611,124 @@ function toggleAnnotationBanFromMenu() {
 .editor {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+}
+
+.editor-split {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.editor-pane {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.pane-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  cursor: default;
+  user-select: none;
+}
+
+.editor-pane.is-active .pane-header {
+  color: var(--text);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.pane-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-close {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.pane-close:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.split-resizer {
+  position: relative;
+  z-index: 5;
+  flex-shrink: 0;
+  width: 5px;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  cursor: col-resize;
+  touch-action: none;
+  transition: background-color 0.16s ease;
+}
+
+.split-resizer:hover,
+.split-resizer.is-dragging {
+  background: var(--accent);
+}
+
+.editor-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+}
+
+.editor-drop-zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  pointer-events: none;
+  transition:
+    left 0.14s ease,
+    width 0.14s ease;
+}
+
+.editor-drop-label {
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.btn.split-toggle.is-on {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .resizer {
@@ -2953,8 +3855,40 @@ function toggleAnnotationBanFromMenu() {
   color: var(--text);
 }
 
+.sidebar-resizer {
+  position: relative;
+  z-index: 10;
+  flex-shrink: 0;
+  width: 6px;
+  margin-right: -6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: transparent;
+  transition: background-color 0.16s ease;
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after,
+.sidebar-resizer.is-dragging::after {
+  background: var(--accent);
+}
+
+.sidebar-resizer:focus-visible {
+  outline: none;
+}
+
 .sidebar {
-  width: 288px;
+  width: var(--sidebar-width, 288px);
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -2963,6 +3897,10 @@ function toggleAnnotationBanFromMenu() {
   overflow-y: auto;
   background: var(--bg-raised);
   border-left: 1px solid var(--border);
+}
+
+.sidebar > * {
+  flex-shrink: 0;
 }
 
 .side-card {
@@ -3310,8 +4248,20 @@ function toggleAnnotationBanFromMenu() {
     border-top: 1px solid var(--border);
   }
 
-  .resizer {
+  .resizer,
+  .sidebar-resizer,
+  .split-toggle,
+  .split-resizer,
+  .pane-header {
     display: none;
+  }
+
+  .editor-pane:not(.is-active) {
+    display: none;
+  }
+
+  .editor-pane {
+    flex: 1 1 auto !important;
   }
 
   .sidebar {

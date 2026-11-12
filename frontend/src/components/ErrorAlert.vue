@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from 'vue'
+import { collapse, expand } from '@/motion'
 
 const props = defineProps({
   messages: {
@@ -19,23 +20,33 @@ const list = computed(() => {
 
   return values.filter(value => typeof value === 'string' && value.trim())
 })
+
+function onEnter(el, done) {
+  expand(el).then(done)
+}
+
+function onLeave(el, done) {
+  collapse(el).then(done)
+}
 </script>
 
 <template>
-  <div
-    v-if="list.length"
-    class="alert alert-error form-alert"
-    role="alert"
-    aria-live="assertive"
-  >
-    <span class="form-alert-icon" aria-hidden="true">!</span>
-    <div class="form-alert-body">
-      <p class="form-alert-title">{{ title }}</p>
-      <ul class="form-alert-list">
-        <li v-for="(message, index) in list" :key="index">{{ message }}</li>
-      </ul>
+  <Transition :css="false" @enter="onEnter" @leave="onLeave">
+    <div
+      v-if="list.length"
+      class="alert alert-error form-alert"
+      role="alert"
+      aria-live="assertive"
+    >
+      <span class="form-alert-icon" aria-hidden="true">!</span>
+      <div class="form-alert-body">
+        <p class="form-alert-title">{{ title }}</p>
+        <ul class="form-alert-list">
+          <li v-for="(message, index) in list" :key="index">{{ message }}</li>
+        </ul>
+      </div>
     </div>
-  </div>
+  </Transition>
 </template>
 
 <style scoped>

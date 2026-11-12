@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import api, { saveAuth } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
+import PasswordInput from '@/components/PasswordInput.vue'
 import TurnstileCaptcha from '@/components/TurnstileCaptcha.vue'
 import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
@@ -230,10 +231,8 @@ const register_user = async () => {
 
         <div class="field">
           <label class="label" for="password">Пароль</label>
-          <input
-            type="password"
+          <PasswordInput
             id="password"
-            class="input"
             v-model="password"
             required
             :disabled="isLoading"
@@ -252,10 +251,8 @@ const register_user = async () => {
 
         <div class="field">
           <label class="label" for="password_check">Повторите пароль</label>
-          <input
-            type="password"
+          <PasswordInput
             id="password_check"
-            class="input"
             v-model="password_check"
             required
             :disabled="isLoading"

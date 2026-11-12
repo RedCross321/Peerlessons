@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import api, { saveAuth } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
+import PasswordInput from '@/components/PasswordInput.vue'
 import TurnstileCaptcha from '@/components/TurnstileCaptcha.vue'
 import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
@@ -221,10 +222,8 @@ function backToPassword() {
 
         <div class="field">
           <label class="label" for="password">Пароль</label>
-          <input
-            type="password"
+          <PasswordInput
             id="password"
-            class="input"
             v-model="password"
             required
             :disabled="isLoading"

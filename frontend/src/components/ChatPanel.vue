@@ -1,7 +1,9 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import api from '@/auth'
+import UiIcon from '@/components/UiIcon.vue'
 import { getErrorMessages } from '@/utils/errors'
+import { clamp, readStoredSize, startDrag, storeSize } from '@/utils/dragResize'
 
 const props = defineProps({
   socket: {
@@ -38,13 +40,62 @@ const props = defineProps({
   }
 })
 
-const REACTIONS = ['👍', '❤️', '😄', '🎉', '👀', '✅']
+const REACTIONS = [
+  { id: 'like', label: 'Нравится' },
+  { id: 'heart', label: 'Сердце' },
+  { id: 'smile', label: 'Смешно' },
+  { id: 'party', label: 'Ура' },
+  { id: 'eyes', label: 'Смотрю' },
+  { id: 'check', label: 'Готово' },
+]
+const REACTION_LABELS = Object.fromEntries(REACTIONS.map((r) => [r.id, r.label]))
 const PAGE_SIZE = 50
 
 const messages = ref([])
 const pinned = ref([])
 const text = ref('')
 const listEl = ref(null)
+
+const CHAT_HEIGHT_KEY = 'peerlessons-chat-height'
+const DEFAULT_CHAT_HEIGHT = 280
+const MIN_CHAT_HEIGHT = 120
+const MAX_CHAT_HEIGHT = 1200
+const chatHeight = ref(readStoredSize(CHAT_HEIGHT_KEY, DEFAULT_CHAT_HEIGHT))
+
+function setChatHeight(value) {
+  const max = Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, window.innerHeight - 220))
+  const next = clamp(Math.round(value), MIN_CHAT_HEIGHT, max)
+  if (next === chatHeight.value) return
+
+  const el = listEl.value
+  const atBottom = el ? el.scrollHeight - el.scrollTop - el.clientHeight < 8 : false
+  chatHeight.value = next
+  if (atBottom) nextTick(() => { if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight })
+}
+
+function startChatResize(event) {
+  const startHeight = chatHeight.value
+  startDrag(event, {
+    axis: 'y',
+    onMove: (delta) => setChatHeight(startHeight + delta),
+    onEnd: () => storeSize(CHAT_HEIGHT_KEY, chatHeight.value),
+  })
+}
+
+function resetChatHeight() {
+  setChatHeight(DEFAULT_CHAT_HEIGHT)
+  storeSize(CHAT_HEIGHT_KEY, chatHeight.value)
+}
+
+function onChatResizerKey(event) {
+  const step = event.shiftKey ? 60 : 20
+  if (event.key === 'ArrowDown') setChatHeight(chatHeight.value + step)
+  else if (event.key === 'ArrowUp') setChatHeight(chatHeight.value - step)
+  else if (event.key === 'Home') setChatHeight(DEFAULT_CHAT_HEIGHT)
+  else return
+  event.preventDefault()
+  storeSize(CHAT_HEIGHT_KEY, chatHeight.value)
+}
 const expanded = ref(true)
 const unreadCount = ref(0)
 const mentionCount = ref(0)
@@ -643,7 +694,7 @@ onBeforeUnmount(() => {
             :title="message.text"
             @click="scrollToMessage(message.id)"
           >
-            <span class="chat-pinned-pin" aria-hidden="true">📌</span>
+            <span class="chat-pinned-pin" aria-hidden="true"><UiIcon name="pin" :size="11" /></span>
             <span class="chat-pinned-author">{{ message.username }}</span>
             <span class="chat-pinned-text">{{ message.text }}</span>
           </button>
@@ -662,7 +713,9 @@ onBeforeUnmount(() => {
 
       <div
         ref="listEl"
+        v-enter-children="{ selector: '.chat-message', max: 3 }"
         class="chat-messages"
+        :style="{ '--chat-height': chatHeight + 'px' }"
         role="log"
         aria-live="polite"
         aria-relevant="additions text"
@@ -723,7 +776,7 @@ onBeforeUnmount(() => {
                 :aria-label="message.pinned ? 'Открепить сообщение' : 'Закрепить сообщение'"
                 @click.stop="togglePin(message)"
               >
-                📌
+                <UiIcon name="pin" :size="12" />
               </button>
               <button
                 v-if="message.user_id === myUserId || isHost"
@@ -799,10 +852,12 @@ onBeforeUnmount(() => {
                   { mine: reaction.user_ids.includes(myUserId) }
                 ]"
                 :aria-pressed="reaction.user_ids.includes(myUserId)"
-                :aria-label="`${reaction.emoji}: ${reaction.count}`"
+                :aria-label="`${REACTION_LABELS[reaction.emoji] || reaction.emoji}: ${reaction.count}`"
+                :title="REACTION_LABELS[reaction.emoji] || reaction.emoji"
                 @click.stop="toggleReaction(message, reaction.emoji)"
               >
-                {{ reaction.emoji }} <span>{{ reaction.count }}</span>
+                <UiIcon :name="reaction.emoji" :size="12" />
+                <span>{{ reaction.count }}</span>
               </button>
 
               <div class="chat-reaction-add">
@@ -813,7 +868,7 @@ onBeforeUnmount(() => {
                   title="Добавить реакцию"
                   @click.stop="toggleReactionPicker(message.id)"
                 >
-                  ＋
+                  <UiIcon name="plus" :size="12" :stroke-width="2.2" />
                 </button>
                 <div
                   v-if="reactionPickerId === message.id"
@@ -822,20 +877,38 @@ onBeforeUnmount(() => {
                   aria-label="Выбрать реакцию"
                 >
                   <button
-                    v-for="emoji in REACTIONS"
-                    :key="emoji"
+                    v-for="reaction in REACTIONS"
+                    :key="reaction.id"
                     type="button"
                     class="chat-reaction-option"
-                    :aria-label="`Реакция ${emoji}`"
-                    @click.stop="toggleReaction(message, emoji)"
+                    :aria-label="`Реакция: ${reaction.label}`"
+                    :title="reaction.label"
+                    @click.stop="toggleReaction(message, reaction.id)"
                   >
-                    {{ emoji }}
+                    <UiIcon :name="reaction.id" :size="15" />
                   </button>
                 </div>
               </div>
             </div>
           </div>
         </div>
+      </div>
+
+      <div
+        class="chat-resizer"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Высота чата"
+        :aria-valuenow="chatHeight"
+        :aria-valuemin="MIN_CHAT_HEIGHT"
+        :aria-valuemax="MAX_CHAT_HEIGHT"
+        tabindex="0"
+        title="Потяните, чтобы изменить высоту чата. Двойной клик — по умолчанию"
+        @pointerdown="startChatResize"
+        @dblclick="resetChatHeight"
+        @keydown="onChatResizerKey"
+      >
+        <span class="chat-resizer-grip" aria-hidden="true"></span>
       </div>
 
       <p
@@ -1023,7 +1096,8 @@ onBeforeUnmount(() => {
 
 .chat-pinned-pin {
   flex-shrink: 0;
-  font-size: 9px;
+  display: inline-flex;
+  color: var(--accent);
 }
 
 .chat-pinned-author {
@@ -1063,11 +1137,40 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-height: 96px;
-  max-height: 280px;
+  height: var(--chat-height, 280px);
   padding: 2px;
   overflow-y: auto;
   scrollbar-width: thin;
+}
+
+.chat-resizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 12px;
+  margin: -2px 0;
+  border-radius: 6px;
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.chat-resizer-grip {
+  width: 36px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  transition: background-color 0.16s ease, width 0.2s ease;
+}
+
+.chat-resizer:hover .chat-resizer-grip,
+.chat-resizer:focus-visible .chat-resizer-grip,
+.chat-resizer.is-dragging .chat-resizer-grip {
+  width: 56px;
+  background: var(--accent);
+}
+
+.chat-resizer:focus-visible {
+  outline: none;
 }
 
 .chat-load-more {
@@ -1166,6 +1269,10 @@ onBeforeUnmount(() => {
 .chat-pin-btn:hover,
 .chat-pin-btn.active {
   opacity: 1;
+}
+
+.chat-pin-btn.active {
+  color: var(--accent);
 }
 
 .chat-delete-btn {
@@ -1354,13 +1461,15 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 5px;
   background: transparent;
-  font-size: 14px;
+  color: var(--text-muted);
   line-height: 1;
   cursor: pointer;
+  transition: color 0.16s ease, background-color 0.16s ease;
 }
 
 .chat-reaction-option:hover {
   background: var(--surface-2);
+  color: var(--accent);
 }
 
 .chat-typing {

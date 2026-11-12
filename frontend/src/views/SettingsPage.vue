@@ -1,11 +1,14 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { logout, saveAuth, saveUser } from '@/auth'
 import ErrorAlert from '@/components/ErrorAlert.vue'
+import PasswordInput from '@/components/PasswordInput.vue'
+import UiIcon from '@/components/UiIcon.vue'
 import { useTheme } from '@/theme'
 import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
+import { stagger, switchThemeWithTransition } from '@/motion'
 
 const route = useRoute()
 const router = useRouter()
@@ -105,6 +108,67 @@ const themeOptions = [
   { value: 'dark', label: 'Тёмная', description: 'Всегда тёмная' },
   { value: 'light', label: 'Светлая', description: 'Всегда светлая' },
 ]
+
+function previewVariants(value) {
+  return value === 'system' ? ['light', 'dark'] : [value]
+}
+
+function pickTheme(value, event) {
+  if (themePreference.value === value) return
+  switchThemeWithTransition(() => setTheme(value), event)
+}
+
+const navListEl = ref(null)
+const indicatorEl = ref(null)
+const sectionEls = {}
+
+function moveIndicator() {
+  const list = navListEl.value
+  const indicator = indicatorEl.value
+  if (!list || !indicator) return
+
+  const active = list.querySelector('.settings-nav-item.is-active')
+  if (!active) {
+    indicator.style.opacity = '0'
+    return
+  }
+
+  indicator.style.width = `${active.offsetWidth}px`
+  indicator.style.height = `${active.offsetHeight}px`
+  indicator.style.transform = `translate(${active.offsetLeft}px, ${active.offsetTop}px)`
+  indicator.style.opacity = '1'
+  list.classList.add('has-indicator')
+}
+
+let indicatorResize = null
+
+watch(navListEl, (list) => {
+  indicatorResize?.disconnect()
+  if (!list) return
+  nextTick(() => {
+    const indicator = indicatorEl.value
+    if (indicator) indicator.style.transition = 'none'
+    moveIndicator()
+    requestAnimationFrame(() => indicator?.style.removeProperty('transition'))
+  })
+  if (typeof ResizeObserver !== 'undefined') {
+    indicatorResize = new ResizeObserver(() => moveIndicator())
+    indicatorResize.observe(list)
+  }
+})
+
+watch(activeSection, async () => {
+  await nextTick()
+  moveIndicator()
+
+  const section = sectionEls[activeSection.value]
+  if (section) {
+    section.scrollTop = 0
+    stagger(section.children, { y: 12, blur: 4, duration: 520, step: 45 })
+  }
+})
+
+onBeforeUnmount(() => indicatorResize?.disconnect())
 
 const resolvedThemeLabel = computed(() => (resolvedTheme.value === 'light' ? 'светлая' : 'тёмная'))
 
@@ -466,8 +530,8 @@ onMounted(loadAccount)
 
 <template>
   <main class="page">
-    <div class="account-inner">
-      <div class="account-head">
+    <div class="settings-inner">
+      <div v-reveal="{ y: -8, blur: 0 }" class="account-head">
         <RouterLink to="/" class="brand brand--compact">
           <span class="brand-mark">/</span>
           <span class="brand-name">Peerlessons</span>
@@ -476,7 +540,12 @@ onMounted(loadAccount)
       </div>
 
       <ErrorAlert :messages="errorMessages" title="Не удалось сохранить изменения" />
-      <div v-if="successMessage" class="alert alert-success" role="alert">
+      <div
+        v-if="successMessage"
+        v-reveal="{ y: -6, blur: 0, duration: 420 }"
+        class="alert alert-success"
+        role="alert"
+      >
         {{ successMessage }}
       </div>
 
@@ -486,9 +555,18 @@ onMounted(loadAccount)
       </div>
 
       <div v-else-if="account" class="settings-layout">
-        <aside class="card settings-nav">
+        <aside
+          v-reveal="{ x: -16, y: 0, duration: 600 }"
+          class="card settings-nav"
+        >
           <p class="settings-nav-title">Настройки</p>
-          <nav class="settings-nav-list" aria-label="Разделы настроек">
+          <nav
+            ref="navListEl"
+            v-stagger="{ selector: '.settings-nav-item', x: -10, y: 0, blur: 0, step: 45, delay: 120 }"
+            class="settings-nav-list"
+            aria-label="Разделы настроек"
+          >
+            <span ref="indicatorEl" class="settings-nav-indicator" aria-hidden="true"></span>
             <button
               v-for="section in settingsSections"
               :key="section.id"
@@ -517,8 +595,12 @@ onMounted(loadAccount)
           </nav>
         </aside>
 
-        <div class="settings-content">
-          <section v-show="activeSection === 'profile'" class="card account-card">
+        <div v-reveal="{ delay: 140, duration: 620 }" class="settings-content">
+          <section
+            v-show="activeSection === 'profile'"
+            :ref="(el) => (sectionEls['profile'] = el)"
+            class="card account-card"
+          >
             <h2 class="account-section-title">Профиль</h2>
             <p class="account-section-sub">
               Текущая почта: <b>{{ account.email }}</b>
@@ -566,10 +648,8 @@ onMounted(loadAccount)
                 </div>
                 <div class="field">
                   <label class="label" for="account-email-password"> Текущий пароль </label>
-                  <input
+                  <PasswordInput
                     id="account-email-password"
-                    class="input"
-                    type="password"
                     v-model="emailPassword"
                     required
                     :disabled="emailLoading"
@@ -636,7 +716,11 @@ onMounted(loadAccount)
             </div>
           </section>
 
-          <section v-show="activeSection === 'security'" class="card account-card">
+          <section
+            v-show="activeSection === 'security'"
+            :ref="(el) => (sectionEls['security'] = el)"
+            class="card account-card"
+          >
             <h2 class="account-section-title">Безопасность</h2>
             <p class="account-section-sub">Пароль и двухфакторная аутентификация.</p>
 
@@ -649,10 +733,8 @@ onMounted(loadAccount)
               <form class="auth-form" novalidate @submit.prevent="changePassword">
                 <div class="field">
                   <label class="label" for="account-current-password"> Текущий пароль </label>
-                  <input
+                  <PasswordInput
                     id="account-current-password"
-                    class="input"
-                    type="password"
                     v-model="currentPassword"
                     required
                     :disabled="passwordLoading"
@@ -661,10 +743,8 @@ onMounted(loadAccount)
                 </div>
                 <div class="field">
                   <label class="label" for="account-new-password"> Новый пароль </label>
-                  <input
+                  <PasswordInput
                     id="account-new-password"
-                    class="input"
-                    type="password"
                     v-model="newPassword"
                     required
                     :disabled="passwordLoading"
@@ -676,10 +756,8 @@ onMounted(loadAccount)
                   <label class="label" for="account-new-password-check">
                     Повторите новый пароль
                   </label>
-                  <input
+                  <PasswordInput
                     id="account-new-password-check"
-                    class="input"
-                    type="password"
                     v-model="newPasswordCheck"
                     required
                     :disabled="passwordLoading"
@@ -710,10 +788,8 @@ onMounted(loadAccount)
                 <form class="auth-form" novalidate @submit.prevent="disableTotp">
                   <div class="field">
                     <label class="label" for="totp-disable-password"> Текущий пароль </label>
-                    <input
+                    <PasswordInput
                       id="totp-disable-password"
-                      class="input"
-                      type="password"
                       v-model="disablePassword"
                       required
                       :disabled="totpLoading"
@@ -750,10 +826,8 @@ onMounted(loadAccount)
                   <form class="auth-form" novalidate @submit.prevent="startTotpSetup">
                     <div class="field">
                       <label class="label" for="totp-setup-password"> Текущий пароль </label>
-                      <input
+                      <PasswordInput
                         id="totp-setup-password"
-                        class="input"
-                        type="password"
                         v-model="setupPassword"
                         required
                         :disabled="totpLoading"
@@ -836,7 +910,11 @@ onMounted(loadAccount)
             </div>
           </section>
 
-          <section v-show="activeSection === 'data'" class="card account-card">
+          <section
+            v-show="activeSection === 'data'"
+            :ref="(el) => (sectionEls['data'] = el)"
+            class="card account-card"
+          >
             <h2 class="account-section-title">Данные и аккаунт</h2>
             <p class="account-section-sub">
               Экспорт персональных данных и безвозвратное удаление аккаунта.
@@ -882,10 +960,8 @@ onMounted(loadAccount)
               <form class="auth-form" novalidate @submit.prevent="deleteAccount">
                 <div class="field">
                   <label class="label" for="account-delete-password">Пароль</label>
-                  <input
+                  <PasswordInput
                     id="account-delete-password"
-                    class="input"
-                    type="password"
                     v-model="deletePassword"
                     autocomplete="current-password"
                     required
@@ -926,7 +1002,11 @@ onMounted(loadAccount)
             </div>
           </section>
 
-          <section v-show="activeSection === 'appearance'" class="card account-card">
+          <section
+            v-show="activeSection === 'appearance'"
+            :ref="(el) => (sectionEls['appearance'] = el)"
+            class="card account-card"
+          >
             <h2 class="account-section-title">Оформление</h2>
             <p class="account-section-sub">Тема интерфейса. Выбор сохраняется в этом браузере.</p>
 
@@ -942,13 +1022,24 @@ onMounted(loadAccount)
                 ]"
                 role="radio"
                 :aria-checked="themePreference === option.value"
-                @click="setTheme(option.value)"
+                @click="pickTheme(option.value, $event)"
               >
-                <span class="theme-preview" aria-hidden="true">
-                  <span class="theme-preview-bar"></span>
-                  <span class="theme-preview-body">
-                    <span class="theme-preview-side"></span>
-                    <span class="theme-preview-main"></span>
+                <span
+                  class="theme-preview"
+                  :class="`theme-preview--${option.value}`"
+                  aria-hidden="true"
+                >
+                  <span
+                    v-for="variant in previewVariants(option.value)"
+                    :key="variant"
+                    class="theme-mock"
+                    :class="`theme-mock--${variant}`"
+                  >
+                    <span class="theme-mock-bar"><i></i><i></i><i></i></span>
+                    <span class="theme-mock-body">
+                      <span class="theme-mock-side"><i></i><i></i><i></i></span>
+                      <span class="theme-mock-main"><i></i><i></i><i></i><i></i></span>
+                    </span>
                   </span>
                 </span>
                 <span class="theme-option-body">
@@ -958,7 +1049,7 @@ onMounted(loadAccount)
                   </span>
                 </span>
                 <span class="theme-option-check" aria-hidden="true">
-                  {{ themePreference === option.value ? '✓' : '' }}
+                  <UiIcon v-if="themePreference === option.value" name="check" :size="16" :stroke-width="2.4" />
                 </span>
               </button>
             </div>

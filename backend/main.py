@@ -134,7 +134,6 @@ from totp_crypto import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 # Миграции, которые create_all() не делает: он создаёт только недостающие
 # таблицы и не трогает существующие.
 _SCHEMA_STATEMENTS = (
@@ -144,7 +143,6 @@ _SCHEMA_STATEMENTS = (
     # Шифротекст TOTP-секрета (AES-GCM ~83 символа) не влезает в прежние 64.
     "ALTER TABLE user_totp ALTER COLUMN secret TYPE VARCHAR(255)",
 )
-
 
 def _backfill_room_aliases() -> None:
     """Проставляет псевдонимы комнатам, созданным до появления колонки."""
@@ -162,6 +160,32 @@ def _backfill_room_aliases() -> None:
         db.commit()
         logger.info("Проставлены псевдонимы для %s комнат", len(rooms))
 
+_LEGACY_REACTIONS = {
+    "\U0001F44D": "like",
+    "\u2764\uFE0F": "heart",
+    "\u2764": "heart",
+    "\U0001F604": "smile",
+    "\U0001F389": "party",
+    "\U0001F440": "eyes",
+    "\u2705": "check",
+}
+
+def _migrate_legacy_reactions() -> None:
+    with engine.begin() as conn:
+        for legacy, reaction_id in _LEGACY_REACTIONS.items():
+            conn.execute(
+                text(
+                    "DELETE FROM chat_reactions AS old WHERE old.emoji = :legacy "
+                    "AND EXISTS (SELECT 1 FROM chat_reactions AS cur "
+                    "WHERE cur.message_id = old.message_id AND cur.user_id = old.user_id "
+                    "AND cur.emoji = :new)"
+                ),
+                {"legacy": legacy, "new": reaction_id},
+            )
+            conn.execute(
+                text("UPDATE chat_reactions SET emoji = :new WHERE emoji = :legacy"),
+                {"legacy": legacy, "new": reaction_id},
+            )
 
 def ensure_schema_compatibility() -> None:
     """Идемпотентно доводит схему БД до версии, ожидаемой кодом.
@@ -188,6 +212,10 @@ def ensure_schema_compatibility() -> None:
     except SQLAlchemyError:
         logger.exception("Не удалось проставить псевдонимы старым комнатам")
 
+    try:
+        _migrate_legacy_reactions()
+    except SQLAlchemyError:
+        logger.exception("Не удалось перевести старые реакции чата")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -208,7 +236,6 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_schema_compatibility()
     yield
-
 
 app = FastAPI(
     lifespan=lifespan,
@@ -235,7 +262,6 @@ DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 init_sentry()
-
 
 @app.middleware("http")
 async def observe_http(request: Request, call_next: Any) -> Response:
@@ -283,7 +309,6 @@ async def observe_http(request: Request, call_next: Any) -> Response:
 
     response.headers["X-Request-ID"] = request_id
     return response
-
 
 class DebouncedSaver:
     """
@@ -377,9 +402,7 @@ class DebouncedSaver:
             finally:
                 db.close()
 
-
 debounce_saver = DebouncedSaver(delay=1.5)
-
 
 class ConnectionManager:
     def __init__(self):
@@ -608,9 +631,7 @@ class ConnectionManager:
 
         return affected
 
-
 manager = ConnectionManager()
-
 
 def ws_message_kind(value: Any) -> str:
     """Низкокардинальный ярлык для метрики WebSocket-сообщений."""
@@ -637,7 +658,6 @@ def ws_message_kind(value: Any) -> str:
         return value
     return "other"
 
-
 # Ограничения на пометки, чтобы комната не могла раздуть память.
 MAX_ANNOTATION_TEXT = 600
 MAX_ANNOTATIONS_PER_ROOM = 200
@@ -647,7 +667,7 @@ MAX_CHAT_TEXT = 1000
 CHAT_HISTORY_LIMIT = 50
 CHAT_PAGE_LIMIT = 100
 CHAT_PINNED_LIMIT = 10
-CHAT_REACTIONS = ["👍", "❤️", "😄", "🎉", "👀", "✅"]
+CHAT_REACTIONS = ["like", "heart", "smile", "party", "eyes", "check"]
 CHAT_REACTION_SET = set(CHAT_REACTIONS)
 
 # Журнал взаимодействий с общим превью и допустимые действия.
@@ -660,7 +680,6 @@ FILE_NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MAX_ROOM_FILES = 30
-
 
 def chat_reactions_map(
     db: Session, message_ids: list[int]
@@ -697,7 +716,6 @@ def chat_reactions_map(
         for message_id, emojis in grouped.items()
     }
 
-
 def serialize_chat_message(
     message: ChatMessage, reactions: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
@@ -716,7 +734,6 @@ def serialize_chat_message(
         "reactions": reactions or [],
     }
 
-
 def chat_messages_payload(
     db: Session, messages: list[ChatMessage]
 ) -> list[dict[str, Any]]:
@@ -725,7 +742,6 @@ def chat_messages_payload(
         serialize_chat_message(message, reactions.get(message.id, []))
         for message in messages
     ]
-
 
 def chat_pinned_payload(db: Session, room_uuid: UUID) -> list[dict[str, Any]]:
     messages = (
@@ -740,14 +756,26 @@ def chat_pinned_payload(db: Session, room_uuid: UUID) -> list[dict[str, Any]]:
     )
     return chat_messages_payload(db, messages)
 
+def ordered_file_names(code: dict[str, Any] | None) -> list[str]:
+    safe = code if isinstance(code, dict) else {}
+    files = safe.get("files")
+    names = list(files.keys()) if isinstance(files, dict) else []
+    saved = safe.get("order")
+    order = [name for name in saved if name in names] if isinstance(saved, list) else []
+    seen = set(order)
+    kind_rank = {"html": 0, "css": 1, "js": 2}
+    rest = sorted(
+        (name for name in names if name not in seen),
+        key=lambda name: (kind_rank.get(name.rsplit(".", 1)[-1].lower(), 3), name.lower()),
+    )
+    order.extend(rest)
+    return order
 
 def normalize_file_name(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
-
 def is_valid_file_name(name: str) -> bool:
     return bool(name) and len(name) <= 64 and FILE_NAME_PATTERN.match(name) is not None
-
 
 def default_file_content(name: str) -> str:
     lower = name.lower()
@@ -767,7 +795,6 @@ def default_file_content(name: str) -> str:
     if lower.endswith(".css"):
         return "/* Новый файл стилей */\n"
     return "// Новый файл скрипта\n"
-
 
 def valid_annotation_selection(selection: Any) -> dict[str, int] | None:
     """Проверяет и нормализует диапазон выделения из WebSocket-сообщения."""
@@ -796,7 +823,6 @@ def valid_annotation_selection(selection: Any) -> dict[str, int] | None:
         return None
 
     return values
-
 
 def get_websocket_user(token: str | None, db: Session) -> User:
     """Аналог get_current_user, но для WebSocket соединений."""
@@ -834,16 +860,13 @@ def get_websocket_user(token: str | None, db: Session) -> User:
 
     return user
 
-
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "ok"}
 
-
 @app.get("/health/live")
 def health_live() -> dict[str, Any]:
     return {"status": "ok"}
-
 
 @app.get("/health/ready")
 def health_ready(db: DbSession) -> JSONResponse:
@@ -859,7 +882,6 @@ def health_ready(db: DbSession) -> JSONResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-
 @app.get("/metrics", include_in_schema=False)
 def metrics(db: DbSession) -> Response:
     if not settings.metrics_enabled:
@@ -873,7 +895,6 @@ def metrics(db: DbSession) -> Response:
 
     return metrics_response()
 
-
 def issue_tokens(db: Session, user: User) -> dict[str, Any]:
     access_token = create_access_token(data={"sub": user.id})
     refresh_token = create_refresh_token(db, user.id)
@@ -885,7 +906,6 @@ def issue_tokens(db: Session, user: User) -> dict[str, Any]:
         "token_type": "bearer",
         "user": user,
     }
-
 
 @app.post(
     "/api/auth/register",
@@ -982,7 +1002,6 @@ async def register(
         "resend_after": settings.email_verification_resend_seconds,
     }
 
-
 @app.post("/api/auth/login", response_model=LoginResponse, tags=["Auth"])
 async def login(
     user_in: UserLogin,
@@ -1016,7 +1035,6 @@ async def login(
 
     return issue_tokens(db, user)
 
-
 @app.post("/api/auth/login/totp", response_model=Token, tags=["Auth"])
 def login_totp(payload: TotpLoginRequest, db: DbSession) -> Any:
     user_id = verify_totp_challenge(payload.challenge)
@@ -1047,7 +1065,6 @@ def login_totp(payload: TotpLoginRequest, db: DbSession) -> Any:
     db.commit()
     return issue_tokens(db, user)
 
-
 @app.post("/api/auth/verify-email", response_model=Token, tags=["Auth"])
 def verify_email(payload: VerifyEmailRequest, db: DbSession) -> Any:
     email = payload.email.strip().lower()
@@ -1074,7 +1091,6 @@ def verify_email(payload: VerifyEmailRequest, db: DbSession) -> Any:
     db.refresh(user)
 
     return issue_tokens(db, user)
-
 
 @app.post(
     "/api/auth/resend-verification",
@@ -1139,7 +1155,6 @@ async def resend_verification(
         "expires_in": settings.email_verification_expire_minutes * 60,
     }
 
-
 @app.post("/api/auth/refresh", response_model=Token, tags=["Auth"])
 def refresh_access_token(token_in: RefreshTokenRequest, db: DbSession) -> Any:
     """Выдаёт новый access-токен по действующему refresh-токену."""
@@ -1162,7 +1177,6 @@ def refresh_access_token(token_in: RefreshTokenRequest, db: DbSession) -> Any:
         "user": user,
     }
 
-
 @app.post(
     "/api/auth/logout",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -1177,11 +1191,9 @@ def logout(token_in: RefreshTokenRequest, db: DbSession) -> Response:
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-
 @app.get("/api/me", response_model=UserRead)
 def read_me(current_user: CurrentUser) -> User:
     return current_user
-
 
 @app.get("/api/account", response_model=AccountRead, tags=["Account"])
 def read_account(current_user: CurrentUser, db: DbSession) -> Any:
@@ -1196,7 +1208,6 @@ def read_account(current_user: CurrentUser, db: DbSession) -> Any:
         "totp_enabled": bool(totp and totp.enabled),
         "pending_email": pending.new_email if pending else None,
     }
-
 
 @app.get("/api/account/export", tags=["Account"])
 def export_account(current_user: CurrentUser, db: DbSession) -> Response:
@@ -1309,7 +1320,6 @@ def export_account(current_user: CurrentUser, db: DbSession) -> Response:
             )
         },
     )
-
 
 @app.delete(
     "/api/account",
@@ -1430,7 +1440,6 @@ async def delete_account(
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-
 @app.patch("/api/account/username", response_model=UserRead, tags=["Account"])
 def change_username(
     payload: ChangeUsernameRequest,
@@ -1459,7 +1468,6 @@ def change_username(
     db.refresh(current_user)
     return current_user
 
-
 @app.post("/api/account/password", response_model=Token, tags=["Account"])
 def change_password(
     payload: ChangePasswordRequest,
@@ -1477,7 +1485,6 @@ def change_password(
     db.commit()
 
     return issue_tokens(db, current_user)
-
 
 @app.post(
     "/api/account/email",
@@ -1562,7 +1569,6 @@ async def change_email(
         "resend_after": settings.email_verification_resend_seconds,
     }
 
-
 @app.post(
     "/api/account/email/confirm",
     response_model=UserRead,
@@ -1601,7 +1607,6 @@ def confirm_email_change(
 
     db.refresh(current_user)
     return current_user
-
 
 @app.post(
     "/api/account/totp/setup",
@@ -1653,7 +1658,6 @@ def setup_totp(
         "qr_data_uri": make_qr_data_uri(uri),
     }
 
-
 @app.post(
     "/api/account/totp/enable",
     response_model=TotpEnableResponse,
@@ -1683,7 +1687,6 @@ def enable_totp(
     db.commit()
 
     return {"recovery_codes": codes}
-
 
 @app.post(
     "/api/account/totp/disable",
@@ -1720,7 +1723,6 @@ def disable_totp(
     db.commit()
 
     return {"totp_enabled": False}
-
 
 # ---------- псевдонимы комнат ----------
 
@@ -1782,7 +1784,6 @@ _TRANSLIT_RU = {
     "я": "ya",
 }
 
-
 def slugify_room_alias(value: str) -> str:
     """Приводит псевдоним к виду, пригодному для URL."""
     text = "".join(
@@ -1794,13 +1795,11 @@ def slugify_room_alias(value: str) -> str:
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")[:_ROOM_ALIAS_MAX].strip("-")
 
-
 def _alias_available(db: Session, alias: str) -> bool:
     """Свободен ли псевдоним: не занят и не совпадает с маршрутом сайта."""
     if alias in _RESERVED_ROOM_ALIASES:
         return False
     return db.query(Room.id).filter(Room.alias == alias).first() is None
-
 
 def build_room_alias(db: Session, title: str) -> str:
     """Строит псевдоним комнаты из её названия.
@@ -1828,7 +1827,6 @@ def build_room_alias(db: Session, title: str) -> str:
 
     return f"room-{uuid4().hex[:8]}"
 
-
 @app.post("/api/room", response_model=RoomRead, tags=["Room"])
 def create_room(
     room_in: RoomCreate,
@@ -1842,6 +1840,7 @@ def create_room(
             "main.js": "console.log('Hello');",
         },
         "activeTab": "index.html",
+        "order": ["index.html", "style.css", "main.js"],
     }
 
     # Псевдоним строится из названия. Гонка на уникальности (другой запрос
@@ -1872,7 +1871,6 @@ def create_room(
     db.refresh(room)
     return room
 
-
 @app.get(
     "/api/rooms/by-alias/{alias}",
     response_model=RoomRead,
@@ -1895,14 +1893,12 @@ def get_room_by_alias(
         )
     return room
 
-
 @app.get("/api/room/{room_id}", response_model=RoomRead, tags=["Room"])
 def get_room(room_id: UUID, db: DbSession) -> Room:
     room = db.query(Room).filter(Room.id == room_id).first()
     if not room:
         raise HTTPException(status_code=404, detail="Комната не найдена")
     return room
-
 
 @app.get(
     "/api/room/{room_id}/chat",
@@ -1935,7 +1931,6 @@ def get_room_chat(
         for message in messages
     ]
 
-
 @app.get("/api/rooms/mine", response_model=list[RoomRead], tags=["Room"])
 def get_my_rooms(db: DbSession, current_user: CurrentUser) -> list[Room]:
     """История комнат пользователя: только свои, новые сверху."""
@@ -1946,7 +1941,6 @@ def get_my_rooms(db: DbSession, current_user: CurrentUser) -> list[Room]:
         .limit(100)
         .all()
     )
-
 
 @app.delete(
     "/api/room/{room_id}",
@@ -1982,7 +1976,6 @@ async def delete_room(
         logger.exception(f"Ошибка закрытия соединений удалённой комнаты {room_id}")
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
 
 class RoomSession:
     """Состояние и обработчики одного WebSocket-соединения в комнате."""
@@ -2157,6 +2150,10 @@ class RoomSession:
                 await self._handle_file_create(data)
             case "file-delete":
                 await self._handle_file_delete(data)
+            case "file-rename":
+                await self._handle_file_rename(data)
+            case "file-reorder":
+                await self._handle_file_reorder(data)
             case "raise-hand":
                 await self._handle_raise_hand()
             case "lower-hand":
@@ -2262,6 +2259,9 @@ class RoomSession:
             "files": merged_files,
             "activeTab": active_tab,
         }
+        new_code["order"] = ordered_file_names(
+            {"files": merged_files, "order": current_code.get("order")}
+        )
         room.current_code = new_code
         await debounce_saver.schedule_save(self.room_id, new_code)
 
@@ -2275,6 +2275,7 @@ class RoomSession:
                 "type": "code-update",
                 "files": new_code["files"],
                 "activeTab": new_code["activeTab"],
+                "order": new_code["order"],
             },
             exclude=self.websocket,
         )
@@ -2309,13 +2310,15 @@ class RoomSession:
             await self._send_file_error("Файл с таким именем уже существует")
             return
 
+        order = ordered_file_names(safe_code)
         files[name] = default_file_content(name)
+        order.append(name)
 
         active_tab = safe_code.get("activeTab")
         if not isinstance(active_tab, str) or active_tab not in files:
             active_tab = "index.html" if "index.html" in files else name
 
-        new_code = {"files": files, "activeTab": active_tab}
+        new_code = {"files": files, "activeTab": active_tab, "order": order}
         room.current_code = new_code
         await debounce_saver.schedule_save(self.room_id, new_code)
 
@@ -2324,7 +2327,12 @@ class RoomSession:
 
         await manager.broadcast(
             self.room_id,
-            {"type": "files-update", "files": files, "activeTab": active_tab},
+            {
+                "type": "files-update",
+                "files": files,
+                "activeTab": active_tab,
+                "order": new_code["order"],
+            },
         )
 
     async def _handle_file_delete(self, data: dict[str, Any]) -> None:
@@ -2353,12 +2361,13 @@ class RoomSession:
             return
 
         files.pop(actual_name, None)
+        order = [name for name in ordered_file_names(safe_code) if name != actual_name]
 
         active_tab = safe_code.get("activeTab")
         if not isinstance(active_tab, str) or active_tab not in files:
             active_tab = "index.html" if "index.html" in files else next(iter(files))
 
-        new_code = {"files": files, "activeTab": active_tab}
+        new_code = {"files": files, "activeTab": active_tab, "order": order}
         room.current_code = new_code
         await debounce_saver.schedule_save(self.room_id, new_code)
 
@@ -2377,8 +2386,105 @@ class RoomSession:
 
         await manager.broadcast(
             self.room_id,
-            {"type": "files-update", "files": files, "activeTab": active_tab},
+            {
+                "type": "files-update",
+                "files": files,
+                "activeTab": active_tab,
+                "order": new_code["order"],
+            },
         )
+
+    async def _handle_file_rename(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id:
+            return
+
+        old_raw = normalize_file_name(data.get("from"))
+        new_name = normalize_file_name(data.get("to"))
+        if not old_raw:
+            return
+        if not is_valid_file_name(new_name):
+            await self._send_file_error(
+                "Имя должно быть латиницей и заканчиваться на .html, .css или .js"
+            )
+            return
+
+        room = self.current_room
+        safe_code = room.current_code if isinstance(room.current_code, dict) else {}
+        files = safe_code.get("files")
+        files = dict(files) if isinstance(files, dict) else {}
+
+        old_name = next((name for name in files if name.lower() == old_raw.lower()), None)
+        if old_name is None:
+            await self._send_file_error("Файл не найден")
+            return
+        if new_name == old_name:
+            return
+        if any(name.lower() == new_name.lower() and name != old_name for name in files):
+            await self._send_file_error("Файл с таким именем уже существует")
+            return
+
+        order = [new_name if name == old_name else name for name in ordered_file_names(safe_code)]
+        renamed_files = {
+            (new_name if name == old_name else name): content
+            for name, content in files.items()
+        }
+
+        active_tab = safe_code.get("activeTab")
+        if active_tab == old_name:
+            active_tab = new_name
+        if not isinstance(active_tab, str) or active_tab not in renamed_files:
+            active_tab = order[0]
+
+        new_code = {"files": renamed_files, "activeTab": active_tab, "order": order}
+        room.current_code = new_code
+        await debounce_saver.schedule_save(self.room_id, new_code)
+
+        for annotation in self.state.get("annotations", []):
+            if annotation.get("file") == old_name:
+                annotation["file"] = new_name
+        page = self.state.get("previewPage")
+        if isinstance(page, dict) and page.get("file") == old_name:
+            page["file"] = new_name
+
+        if self.state.get("previewMode") == "shared":
+            self.state["previewEvents"] = []
+
+        await manager.broadcast(
+            self.room_id,
+            {
+                "type": "files-update",
+                "files": renamed_files,
+                "activeTab": active_tab,
+                "order": order,
+                "renamed": {"from": old_name, "to": new_name},
+            },
+        )
+
+    async def _handle_file_reorder(self, data: dict[str, Any]) -> None:
+        if self.current_room.host_id != self.user_id and not self._is_current_editor():
+            return
+
+        incoming = data.get("order")
+        if not isinstance(incoming, list):
+            return
+
+        room = self.current_room
+        safe_code = room.current_code if isinstance(room.current_code, dict) else {}
+        files = safe_code.get("files")
+        if not isinstance(files, dict) or not files:
+            return
+
+        order = ordered_file_names(
+            {"files": files, "order": [name for name in incoming if isinstance(name, str)]}
+        )
+        if order == ordered_file_names(safe_code):
+            return
+
+        new_code = {**safe_code, "files": dict(files), "order": order}
+        room.current_code = new_code
+        await debounce_saver.schedule_save(self.room_id, new_code)
+
+        await manager.broadcast(self.room_id, {"type": "files-order", "order": order})
 
     async def _handle_raise_hand(self) -> None:
         # Создателю комнаты рука не нужна: он возвращает права кнопкой.
@@ -3301,6 +3407,7 @@ class RoomSession:
                 "alias": room.alias,
                 "files": safe_code.get("files", {}),
                 "activeTab": safe_code.get("activeTab", "index.html"),
+                "order": ordered_file_names(safe_code),
                 "showPreview": self.state["showPreview"],
                 "currentEditor": {
                     "user_id": current_editor_id,
@@ -3366,7 +3473,6 @@ class RoomSession:
                 self.room_id,
                 manager.build_participants(self.room_id),
             )
-
 
 @app.websocket("/ws/room/{room_id}")
 async def websocket_room(websocket: WebSocket, room_id: str, db: DbSession) -> None:

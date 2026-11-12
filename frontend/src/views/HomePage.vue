@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import api, { getUser, isLoggedIn, logout } from '@/auth'
 import { getErrorMessages } from '@/utils/errors'
 import { setPageSeo } from '@/utils/seo'
+import { collapse } from '@/motion'
 
 const router = useRouter()
 const authenticated = isLoggedIn()
@@ -70,6 +71,10 @@ async function join() {
 
 function roomLink(room) {
   return `/room/${room.alias || room.id}`
+}
+
+function showRoomKey(room) {
+  return roomKey(room).trim().toLowerCase() !== String(room.title || '').trim().toLowerCase()
 }
 
 function roomKey(room) {
@@ -143,6 +148,10 @@ async function confirmDelete(room) {
   }
 }
 
+function onRoomLeave(el, done) {
+  collapse(el).then(done)
+}
+
 onMounted(() => {
   if (authenticated) loadRooms()
 })
@@ -158,10 +167,17 @@ onMounted(() => {
         </span>
       </div>
 
-      <span class="home-rule"></span>
+      <span
+       
+        class="home-rule"
+      ></span>
 
       <h1 class="home-title">
-        Пишите код <span>вместе</span>,<br>
+        Пишите код
+        <span class="home-title-accent">вместе<i
+            class="home-title-underline"
+            aria-hidden="true"
+          ></i></span>,<br>
         прямо сейчас
       </h1>
 
@@ -182,13 +198,6 @@ onMounted(() => {
           <RouterLink to="/settings" class="btn btn-secondary btn-lg">
             Настройки
           </RouterLink>
-          <button
-            type="button"
-            class="btn btn-ghost btn-lg btn-logout"
-            @click="handleLogout"
-          >
-            Выйти из аккаунта
-          </button>
         </template>
         <template v-else>
           <RouterLink to="/register" class="btn btn-primary btn-lg">
@@ -202,6 +211,7 @@ onMounted(() => {
 
       <form
         v-if="authenticated"
+       
         class="home-join"
         novalidate
         @submit.prevent="join"
@@ -237,19 +247,24 @@ onMounted(() => {
 
       <section
         v-if="authenticated"
+       
         class="home-rooms"
         aria-labelledby="homeRoomsTitle"
       >
         <div class="home-rooms-head">
           <h2 id="homeRoomsTitle" class="home-rooms-title">Мои комнаты</h2>
-          <span v-if="rooms.length" class="home-rooms-count">
-            {{ rooms.length }}
-          </span>
+          <span
+            v-if="rooms.length"
+            class="home-rooms-count"
+          >{{ rooms.length }}</span>
         </div>
 
-        <p v-if="roomsLoading" class="home-rooms-state">
-          Загружаем комнаты…
-        </p>
+        <ul v-if="roomsLoading && !rooms.length" class="home-rooms-list" aria-hidden="true">
+          <li v-for="n in 3" :key="n" class="home-room home-room--skeleton">
+            <span class="skeleton skeleton-title"></span>
+            <span class="skeleton skeleton-meta"></span>
+          </li>
+        </ul>
 
         <div
           v-else-if="roomsError"
@@ -269,14 +284,24 @@ onMounted(() => {
           Здесь появятся комнаты, которые вы создали.
         </p>
 
-        <ul v-else class="home-rooms-list">
-          <li v-for="room in rooms" :key="room.id" class="home-room">
+        <TransitionGroup
+          v-else
+          tag="ul"
+          class="home-rooms-list"
+          :css="false"
+          @leave="onRoomLeave"
+        >
+          <li
+            v-for="room in rooms"
+            :key="room.id"
+            class="home-room"
+          >
             <div class="home-room-main">
               <RouterLink class="home-room-title" :to="roomLink(room)">
                 {{ room.title }}
               </RouterLink>
               <p class="home-room-meta">
-                <span class="home-room-alias">{{ roomKey(room) }}</span>
+                <span v-if="showRoomKey(room)" class="home-room-alias">{{ roomKey(room) }}</span>
                 <span
                   v-if="formatCreatedAt(room.created_at)"
                   class="home-room-date"
@@ -323,16 +348,25 @@ onMounted(() => {
               </template>
             </div>
           </li>
-        </ul>
+        </TransitionGroup>
 
         <p v-if="deleteError" class="field-error home-rooms-delete-error">
           {{ deleteError }}
         </p>
       </section>
 
-      <p v-if="authenticated" class="home-note">
-        Вы вошли как <b>{{ username }}</b>
-      </p>
+      <div v-if="authenticated" class="home-account">
+        <p class="home-note">
+          Вы вошли как <b>{{ username }}</b>
+        </p>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm btn-logout"
+          @click="handleLogout"
+        >
+          Выйти
+        </button>
+      </div>
       <p v-else class="home-note">
         <a href="/about/">Подробнее о проекте</a>
       </p>
@@ -435,12 +469,61 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 14px;
+  padding: 13px 15px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
+  border-radius: 12px;
+  background: var(--card-bg, var(--surface));
+  box-shadow: 0 1px 0 var(--card-highlight) inset;
+  transition: border-color var(--dur) var(--ease-out),
+    transform 0.5s var(--ease-spring, var(--ease-out)),
+    box-shadow var(--dur) var(--ease-out);
   content-visibility: auto;
   contain-intrinsic-size: 64px;
+}
+
+.home-room:not(.home-room--skeleton):hover {
+  border-color: var(--border-strong);
+  transform: translateY(-2px);
+  box-shadow: 0 1px 0 var(--card-highlight) inset,
+    0 14px 30px -18px rgba(0, 0, 0, 0.55);
+}
+
+.home-room--skeleton {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.skeleton {
+  display: block;
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 0%,
+    var(--surface-3) 40%,
+    var(--surface-2) 80%
+  );
+  background-size: 300% 100%;
+  animation: skeleton-shimmer 1.4s var(--ease-in-out) infinite;
+}
+
+.skeleton-title {
+  width: 46%;
+  height: 14px;
+}
+
+.skeleton-meta {
+  width: 28%;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -50% 0;
+  }
 }
 
 .home-room-main {
@@ -449,6 +532,7 @@ onMounted(() => {
 
 .home-room-title {
   display: block;
+  transition: color var(--dur-fast) var(--ease-out);
   overflow: hidden;
   color: var(--text);
   font-size: 14.5px;
@@ -495,6 +579,19 @@ onMounted(() => {
 
 .home-rooms-delete-error {
   margin-top: 10px;
+}
+
+.home-account {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 30px;
+}
+
+.home-account .home-note {
+  margin-top: 0;
 }
 
 @media (max-width: 560px) {
